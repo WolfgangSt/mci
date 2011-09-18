@@ -27,6 +27,7 @@ static if (operatingSystem == OperatingSystem.windows)
 } 
 else
 {
+    import std.c.linux.linux;
 }
 
 
@@ -603,8 +604,11 @@ public final class Interpreter
         {
             case CallingConvention.cdecl:
                 return FFIInterface.platform;
+            static if (operatingSystem == OperatingSystem.windows)
+            {
             case CallingConvention.stdCall:
                 return FFIInterface.stdCall;
+            }
             default:
                 throw new InterpreterException("Unsupported calling convention");
         }
@@ -626,6 +630,14 @@ public final class Interpreter
         }
         else
         {
+            auto libName = toUTFz!(const(char)*)(sig.library);
+            auto impName = toUTFz!(const(char)*)(sig.entryPoint);
+            //auto lib = dlopen(libName, RTLD_NOLOAD);
+
+            //if (lib is null)
+            auto    lib = dlopen(libName, RTLD_LOCAL);
+
+            return cast(FFIFunction)dlsym(lib, impName);
         }
     }
 
@@ -633,6 +645,11 @@ public final class Interpreter
     {
         auto ffisig = *inst.operand.peek!FFISignature();
         auto fptr = resolveEntrypoint(ffisig);
+        
+        if (fptr is null)
+        {
+            throw new InterpreterException("Cannot resolve export " ~ ffisig.entryPoint ~ " in " ~ ffisig.library);
+        }
 
         // by specification ffi is the only instruction in the block and
         // the FFI signature corresponds to the current methods signature.
