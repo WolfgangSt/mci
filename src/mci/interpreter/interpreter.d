@@ -21,6 +21,7 @@ import core.stdc.string,
        mci.vm.memory.info,
        mci.vm.memory.layout,
        mci.vm.memory.prettyprint,
+       mci.vm.thread.thread,
        std.c.stdlib,
        std.stdio,
        std.string,
@@ -29,6 +30,7 @@ import core.stdc.string,
 
 extern (C) void* memcpy(void*, const void*, size_t);
 extern (C) void rt_moduleTlsCtor();
+extern (C) void rt_moduleTlsDtor();
 
 alias calloc _calloc;
 alias free _free;
@@ -1021,6 +1023,8 @@ final class InterpreterContext
             case OperationCode.exEnd:
                 throw new InterpreterException("Unsupported opcode: " ~ inst.opCode.name);
         }
+        
+        //GC.collect();
     }
 }
 
@@ -1255,6 +1259,24 @@ public final class Interpreter
         }
     }
 
+    private void cleanupThread()
+    {
+        writefln("@@@ Thread cleanup");
+        
+        GC.disable();
+        thread_detachThis();
+        rt_moduleTlsDtor();
+        GC.enable();
+        
+        /*
+        rt_moduleTlsDtor();
+        GC.collect();
+        GC.disable();
+        thread_detachThis();
+        GC.enable();        
+        */
+    }
+
     private FFIClosure getClosure(Function function_)
     {
         if (auto cache = _closureCache.get(function_))
@@ -1280,10 +1302,12 @@ public final class Interpreter
             {
                 thread_attachThis();
                 rt_moduleTlsCtor();
+                registerThreadCleanup(&cleanupThread);
             }
             _gc.attach();
           
             runFunction(function_, cast(ubyte*)ret, cast(ubyte**)args);
+            writefln("Trampoline returning to native code");
         };
 
         auto cconv = toFFIConvention(function_.callingConvention);
