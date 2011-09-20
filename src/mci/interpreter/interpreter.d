@@ -1260,21 +1260,14 @@ public final class Interpreter
     }
 
     private void cleanupThread()
-    {
-        writefln("@@@ Thread cleanup");
-        
+    {        
         GC.disable();
-        thread_detachThis();
+        static if (operatingSystem == OperatingSystem.windows)
+            thread_detachThis();
+        else
+            thread_detachByAddr(pthread_self());
         rt_moduleTlsDtor();
         GC.enable();
-        
-        /*
-        rt_moduleTlsDtor();
-        GC.collect();
-        GC.disable();
-        thread_detachThis();
-        GC.enable();        
-        */
     }
 
     private FFIClosure getClosure(Function function_)
@@ -1423,16 +1416,17 @@ public final class Interpreter
 
         auto result = new InterpreterResult();
         result.resultType = returnType;
-        auto resultSize = computeSize(returnType, is32Bit);
-        result.result = new ubyte[resultSize];
-        memcpy(result.result.ptr, context.returnMem, resultSize);
-        _free(context.returnMem);
-
         if (returnType)
         {
+            auto resultSize = computeSize(returnType, is32Bit);
+            result.result = new ubyte[resultSize];
+            memcpy(result.result.ptr, context.returnMem, resultSize);
+            _free(context.returnMem);
+
             writeln("The program quitted with:");
             writeln( prettyPrint( result.resultType, is32Bit, result.result.ptr, "(return value)" ) );
-        }
+        } else
+            writeln("The program quitted without return value.");
         
         return result;
     }
