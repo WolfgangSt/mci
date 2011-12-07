@@ -11,6 +11,7 @@ import mci.core.code.modules,
        mci.core.code.instructions,
        mci.vm.memory.base,
        mci.vm.memory.layout,
+       mci.vm.memory.prettyprint,
        core.stdc.string,
        std.stdio;
 
@@ -380,6 +381,16 @@ public final class Interpreter
                 _ctx = _ctx.returnContext;
 
                 oldCtx.releaseLocals();
+                break;
+
+            case OperationCode.conv:
+                if (inst.targetRegister == inst.sourceRegister1)
+                {
+                    // debug instruction
+                    auto arg = inst.sourceRegister1;
+                    writeln( prettyPrint(arg.type, !is32Bit, _ctx.getValue(arg).data, arg.name ) );
+                } else
+                    goto default;
                 break;
 
 
