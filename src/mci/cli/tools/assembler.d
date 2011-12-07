@@ -19,7 +19,9 @@ import std.getopt,
        mci.vm.io.writer,
        mci.cli.main,
        mci.cli.tool,
-       mci.cli.tools.interpreter;
+       mci.cli.tools.interpreter,
+       mci.interpreter.interpreter,
+       mci.vm.memory.dgc;
 
 public enum string inputFileExtension = ".ial";
 
@@ -192,6 +194,13 @@ public final class AssemblerTool : Tool
             driver = new GeneratorDriver(baseName(output[0 .. $ - moduleFileExtension.length]), manager, units);
             auto mod = driver.run();
 
+            auto writer = new ModuleWriter();
+            if (interpret)
+            {
+                auto interpreter = new Interpreter(new DGarbageCollector());
+                interpreter.interpret(mod);
+                return true;
+            }
             (new ModuleWriter()).save(mod, output);
         }
         catch (IOException ex)
