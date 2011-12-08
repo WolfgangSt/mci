@@ -1,6 +1,7 @@
 module mci.interpreter.interpreter;
 
 import mci.core.code.modules,
+       mci.core.common,
        mci.core.config,
        mci.core.container,
        mci.core.code.functions,
@@ -132,50 +133,12 @@ public final class Interpreter
     // highlevel D emulation of common ALU instuctions
     private void emulateALUForType(T, string op)(void* target, void* lhs, void* rhs)
     {
-         mixin("*cast(T*)target = cast(T)(*cast(T*)lhs " ~ op ~ " *cast(T*)rhs);");
+        static string fullOp = "*cast(T*)target = cast(T)(*cast(T*)lhs " ~ op ~ " *cast(T*)rhs);";
+        static if (__traits(compiles, { mixin(fullop); }))
+            mixin(fullop);
+        else throw new InterpreterException("Invalid operation: " ~ op ~ " for " ~ T.stringof);
     }
 
-    private void emulateALUFloat(string op)(Instruction inst)
-    {
-       
-    }
-
-    private void emulateALUInt(string op)(Instruction inst)
-    {
-        auto lhsType = inst.sourceRegister1.type;
-        auto lhsMem = _ctx.getValue(inst.sourceRegister1).data;
-        auto rhsMem = _ctx.getValue(inst.sourceRegister2).data;
-        auto dstMem = _ctx.getValue(inst.targetRegister).data;
-
-        if (auto typ = cast(Int8Type)lhsType)
-        {
-            emulateALUForType!(byte, op)(dstMem, lhsMem, rhsMem);
-        } else if (auto typ = cast(UInt8Type)lhsType)
-        {
-            emulateALUForType!(ubyte, op)(dstMem, lhsMem, rhsMem);
-        } else if (auto typ = cast(Int16Type)lhsType)
-        {
-            emulateALUForType!(short, op)(dstMem, lhsMem, rhsMem);
-        } else if (auto typ = cast(UInt16Type)lhsType)
-        {
-            emulateALUForType!(ushort, op)(dstMem, lhsMem, rhsMem);
-        } else if (auto typ = cast(Int32Type)lhsType)
-        {
-            emulateALUForType!(int, op)(dstMem, lhsMem, rhsMem);
-        } else if (auto typ = cast(UInt32Type)lhsType)
-        {
-            emulateALUForType!(uint, op)(dstMem, lhsMem, rhsMem);
-        } else if (auto typ = cast(Int64Type)lhsType)
-        {
-            emulateALUForType!(long, op)(dstMem, lhsMem, rhsMem);
-        } else if (auto typ = cast(UInt64Type)lhsType)
-        {
-            emulateALUForType!(ulong, op)(dstMem, lhsMem, rhsMem);
-        } else
-        {
-            throw new InterpreterException("ALU cannot emulated " ~ lhsType.name ~ " yet.");
-        }
-    }
 
     private void emulateALU(string op)(Instruction inst)
     {
@@ -184,40 +147,34 @@ public final class Interpreter
         auto rhsMem = _ctx.getValue(inst.sourceRegister2).data;
         auto dstMem = _ctx.getValue(inst.targetRegister).data;
 
-        if (auto typ = cast(Float64Type)lhsType)
-        {
-            emulateALUForType!(double, op)(dstMem, lhsMem, rhsMem);
-        } else if (auto typ = cast(Float32Type)lhsType)
-        {
-            emulateALUForType!(float, op)(dstMem, lhsMem, rhsMem);
-        } else if (auto typ = cast(Int8Type)lhsType)
-        {
-            emulateALUForType!(byte, op)(dstMem, lhsMem, rhsMem);
-        } else if (auto typ = cast(UInt8Type)lhsType)
-        {
-            emulateALUForType!(ubyte, op)(dstMem, lhsMem, rhsMem);
-        } else if (auto typ = cast(Int16Type)lhsType)
-        {
-            emulateALUForType!(short, op)(dstMem, lhsMem, rhsMem);
-        } else if (auto typ = cast(UInt16Type)lhsType)
-        {
-            emulateALUForType!(ushort, op)(dstMem, lhsMem, rhsMem);
-        } else if (auto typ = cast(Int32Type)lhsType)
-        {
-            emulateALUForType!(int, op)(dstMem, lhsMem, rhsMem);
-        } else if (auto typ = cast(UInt32Type)lhsType)
-        {
-            emulateALUForType!(uint, op)(dstMem, lhsMem, rhsMem);
-        } else if (auto typ = cast(Int64Type)lhsType)
-        {
-            emulateALUForType!(long, op)(dstMem, lhsMem, rhsMem);
-        } else if (auto typ = cast(UInt64Type)lhsType)
-        {
-            emulateALUForType!(ulong, op)(dstMem, lhsMem, rhsMem);
-        } else
-        {
-            throw new InterpreterException("ALU cannot emulated " ~ lhsType.name ~ " yet.");
-        }
+        if (isType!Int8Type(lhsType))
+            return emulateALUForType!(byte, op)(dstMem, lhsMem, rhsMem);
+        
+        if (isType!UInt8Type(lhsType))
+            return emulateALUForType!(ubyte, op)(dstMem, lhsMem, rhsMem);
+        
+        if (isType!Int16Type(lhsType))
+            return emulateALUForType!(short, op)(dstMem, lhsMem, rhsMem);
+        
+        if (isType!UInt16Type(lhsType))
+            return emulateALUForType!(ushort, op)(dstMem, lhsMem, rhsMem);
+        
+        if (isType!Int32Type(lhsType))
+            return emulateALUForType!(int, op)(dstMem, lhsMem, rhsMem);
+        
+        if (isType!UInt32Type(lhsType))
+            return emulateALUForType!(uint, op)(dstMem, lhsMem, rhsMem);
+        
+        if (isType!Int64Type(lhsType))
+            return emulateALUForType!(long, op)(dstMem, lhsMem, rhsMem);
+        
+        if (isType!UInt64Type(lhsType))
+            return emulateALUForType!(ulong, op)(dstMem, lhsMem, rhsMem);
+
+        if (isType!Float32Type(lhsType))
+            return emulateALUForType!(float, op)(dstMem, lhsMem, rhsMem);
+
+        throw new InterpreterException("ALU cannot emulated " ~ lhsType.name ~ " yet.");
     }
 
     private RuntimeObject[] collectArgs()
@@ -299,6 +256,17 @@ public final class Interpreter
                 _ctx.loadRegister!Function(inst.targetRegister, inst.operand);
                 break;
 
+            case OperationCode.loadNull:
+                auto obj = _ctx.getValue(inst.targetRegister);
+                auto sz = computeSize(inst.targetRegister.type, is32Bit);
+                memset(obj.data, 0, sz);
+                break;
+
+            case OperationCode.loadSize:
+                auto size = computeSize(*inst.operand.peek!Type, is32Bit);
+                *cast(size_t*)_ctx.getValue(inst.targetRegister).data = size;
+                break;
+
 
             case OperationCode.fieldSet:
                 auto dest = inst.sourceRegister1;
@@ -377,24 +345,28 @@ public final class Interpreter
                 emulateALU!("/")(inst);
                 break;
 
+            case OperationCode.rem:
+                emulateALU!("%")(inst);
+                break;
+
             case OperationCode.and:
-                emulateALUInt!("&")(inst);
+                emulateALU!("&")(inst);
                 break;
 
             case OperationCode.or:
-                emulateALUInt!("|")(inst);
+                emulateALU!("|")(inst);
                 break;   
 
             case OperationCode.xOr:
-                emulateALUInt!("^")(inst);
+                emulateALU!("^")(inst);
                 break;
 
             case OperationCode.shL:
-                emulateALUInt!("<<")(inst);
+                emulateALU!("<<")(inst);
                 break;
 
             case OperationCode.shR:
-                emulateALUInt!(">>")(inst);
+                emulateALU!(">>")(inst);
                 break;
 
             case OperationCode.return_:
