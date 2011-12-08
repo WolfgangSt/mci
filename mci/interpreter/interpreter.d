@@ -6,6 +6,7 @@ import mci.core.code.modules,
        mci.core.code.functions,
        mci.core.typing.core,
        mci.core.typing.members,
+       mci.core.typing.types,
        mci.core.code.opcodes,
        mci.interpreter.exception,
        mci.core.code.instructions,
@@ -14,6 +15,8 @@ import mci.core.code.modules,
        mci.vm.memory.prettyprint,
        core.stdc.string,
        std.stdio;
+
+typedef void function() functionPointer;
 
 final class InterpreterContext
 {
@@ -243,45 +246,59 @@ public final class Interpreter
             case OperationCode.comment:
                 break;
 
+            case OperationCode.dead:
+                writeln("Warning dead code reached");
+                break;
+
+            case OperationCode.raw:
+                writeln("Interpreter cannot execute raw code");
+                break;
+
             case OperationCode.loadI8:
-                _ctx.loadRegister!byte(inst.targetRegister, inst.operand);                
+                _ctx.loadRegister!byte(inst.targetRegister, inst.operand);
                 break;
 
             case OperationCode.loadUI8:
-                _ctx.loadRegister!ubyte(inst.targetRegister, inst.operand);                
+                _ctx.loadRegister!ubyte(inst.targetRegister, inst.operand);
                 break;
 
             case OperationCode.loadI16:
-                _ctx.loadRegister!short(inst.targetRegister, inst.operand);                
+                _ctx.loadRegister!short(inst.targetRegister, inst.operand);
                 break;
 
             case OperationCode.loadUI16:
-                _ctx.loadRegister!ushort(inst.targetRegister, inst.operand);                
+                _ctx.loadRegister!ushort(inst.targetRegister, inst.operand);
                 break;
 
             case OperationCode.loadI32:
-                _ctx.loadRegister!int(inst.targetRegister, inst.operand);                
+                _ctx.loadRegister!int(inst.targetRegister, inst.operand);
                 break;
 
             case OperationCode.loadUI32:
-                _ctx.loadRegister!uint(inst.targetRegister, inst.operand);                
+                _ctx.loadRegister!uint(inst.targetRegister, inst.operand);
                 break;
 
             case OperationCode.loadI64:
-                _ctx.loadRegister!long(inst.targetRegister, inst.operand);                
+                _ctx.loadRegister!long(inst.targetRegister, inst.operand);
                 break;
 
             case OperationCode.loadUI64:
-                _ctx.loadRegister!ulong(inst.targetRegister, inst.operand);                
+                _ctx.loadRegister!ulong(inst.targetRegister, inst.operand);
                 break;
 
             case OperationCode.loadF32:
-                _ctx.loadRegister!float(inst.targetRegister, inst.operand);                
+                _ctx.loadRegister!float(inst.targetRegister, inst.operand);
                 break;
 
             case OperationCode.loadF64:
-                _ctx.loadRegister!double(inst.targetRegister, inst.operand);                
+                _ctx.loadRegister!double(inst.targetRegister, inst.operand);
                 break;
+
+            case OperationCode.loadFunc:
+                // this assumes that a Function (ref) fits into a function pointer
+                _ctx.loadRegister!Function(inst.targetRegister, inst.operand);
+                break;
+
 
             case OperationCode.fieldSet:
                 auto dest = inst.sourceRegister1;
@@ -317,6 +334,25 @@ public final class Interpreter
                 subContext.returnContext = _ctx;
                 subContext.args = collectArgs();
                 _ctx = subContext; 
+                break;
+
+            case OperationCode.callIndirect:
+            case OperationCode.invokeIndirect:
+                auto funType = cast(FunctionPointerType)inst.sourceRegister1.type;
+                auto funPtr = _ctx.getValue(inst.sourceRegister1).data;
+
+                // TODO: impl this check as soon zor added the functionality
+                //if (funType.callingConvention == CallingConvention.queueCall)
+                if (true)
+                {
+                    auto target = *cast(Function*)funPtr;
+                    auto subContext = new InterpreterContext(target, _gc);
+                    subContext.returnContext = _ctx;
+                    subContext.args = collectArgs();
+                    _ctx = subContext; 
+
+                } else
+                     throw new InterpreterException("Foreign Function Interfacing not supported yet");
                 break;
 
             case OperationCode.callTail:
