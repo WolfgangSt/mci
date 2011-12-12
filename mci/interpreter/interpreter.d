@@ -15,7 +15,8 @@ import mci.core.code.modules,
        mci.vm.memory.layout,
        mci.vm.memory.prettyprint,
        core.stdc.string,
-       std.stdio;
+       std.stdio,
+       std.traits;
 
 typedef void function() functionPointer;
 
@@ -52,7 +53,19 @@ final class InterpreterContext
             auto reg = namereg.y;
             auto size = computeSize(reg.type, is32Bit);
             writefln("Allocating %s bytes %s for %s [%s]", size, reg.type.name, reg.name, cast(void*)reg);
-            _registerState.add(reg, gc.allocate(reg.type, size));
+
+            auto mem = gc.allocate(reg.type, size);
+            _registerState.add(reg, mem);
+
+            if (auto vec = cast(VectorType)reg.type)
+            {
+                // allocate vector data as well
+                auto vecsize = computeSize(vec.elementType, is32Bit) * vec.elements;
+                writefln("  Allocating %s additional bytes for data", vecsize);
+                *cast(ubyte**)mem.data = (new ubyte[vecsize]).ptr;
+            }
+
+            
         }
 
         gotoEntry();
@@ -143,43 +156,208 @@ public final class Interpreter
         {
             mixin(code);
             return;
+        } 
+        else
+            throw new InterpreterException("Invalid operation: " ~ op ~ " for " ~ T.stringof);
+    }
+
+    private struct NullType {};
+
+    private void unaryDispatcher2(string fun, T = NullType)(Register r, T userData)
+    {
+        auto mem = _ctx.getValue(r).data;
+        auto typ = r.type;
+
+        static if (is(T == NullType))
+        {
+            enum string arg = "";
+            enum string pass = "";
         }
-        throw new InterpreterException("Invalid operation: " ~ op ~ " for " ~ T.stringof);
+        else 
+        {
+            enum string arg = "T, ";
+            enum string pass = ", userData";
+        }
+
+        enum string codeI8 = fun ~ "!(" ~ arg ~ "byte)(cast(byte*)mem" ~ pass ~ ");";
+        static if (__traits(compiles, { mixin(codeI8); }))
+        {
+            if (isType!Int8Type(typ))
+            {
+                mixin (codeI8);
+                return;
+            }
+        }
+
+        enum string codeUI8 = fun ~ "!(" ~ arg ~ "ubyte)(cast(ubyte*)mem" ~ pass ~ ");";
+        static if (__traits(compiles, { mixin(codeUI8); }))
+        {
+            if (isType!UInt8Type(typ))
+            {
+                mixin (codeUI8);
+                return;
+            }
+        }
+
+        enum string codeI16 = fun ~ "!(" ~ arg ~ "short)(cast(short*)mem" ~ pass ~ ");";
+        static if (__traits(compiles, { mixin(codeI16); }))
+        {
+            if (isType!Int16Type(typ))
+            {
+                mixin (codeI16);
+                return;
+            }
+        }
+
+        enum string codeUI16 = fun ~ "!(" ~ arg ~ "ushort)(cast(ushort*)mem" ~ pass ~ ");";
+        static if (__traits(compiles, { mixin(codeUI16); }))
+        {
+            if (isType!UInt16Type(typ))
+            {
+                mixin (codeUI16);
+                return;
+            }
+        }
+
+        enum string codeI32 = fun ~ "!(" ~ arg ~ "int)(cast(int*)mem" ~ pass ~ ");";
+        static if (__traits(compiles, { mixin(codeI32); }))
+        {
+            if (isType!Int32Type(typ))
+            {
+                mixin (codeI32);
+                return;
+            }
+        }
+
+        enum string codeUI32 = fun ~ "!(" ~ arg ~ "uint)(cast(uint*)mem" ~ pass ~ ");";
+        static if (__traits(compiles, { mixin(codeUI32); }))
+        {
+            if (isType!UInt32Type(typ))
+            {
+                mixin (codeUI32);
+                return;
+            }
+        }
+
+        enum string codeI64 = fun ~ "!(" ~ arg ~ "long)(cast(long*)mem" ~ pass ~ ");";
+        static if (__traits(compiles, { mixin(codeI64); }))
+        {
+            if (isType!Int64Type(typ))
+            {
+                mixin (codeI64);
+                return;
+            }
+        }
+
+        enum string codeUI64 = fun ~ "!(" ~ arg ~ "ulong)(cast(ulong*)mem" ~ pass ~ ");";
+        static if (__traits(compiles, { mixin(codeUI64); }))
+        {
+            if (isType!UInt64Type(typ))
+            {
+                mixin (codeUI64);
+                return;
+            }
+        }
+
+        enum string codeFloat32 = fun ~ "!(" ~ arg ~ "float)(cast(float*)mem" ~ pass ~ ");";
+        static if (__traits(compiles, { mixin(codeFloat32); }))
+        {
+            if (isType!Float32Type(typ))
+            {
+                mixin (codeFloat32);
+                return;
+            }
+        }
+
+        enum string codeFloat64 = fun ~ "!(" ~ arg ~ "double)(cast(double*)mem" ~ pass ~ ");";
+        static if (__traits(compiles, { mixin(codeFloat64); }))
+        {
+            if (isType!Float64Type(typ))
+            {
+                mixin (codeFloat64);
+                return;
+            }
+        }
+
+        enum string codeNativeUInt = fun ~ "!(" ~ arg ~ "size_t)(cast(size_t*)mem" ~ pass ~ ");";
+        static if (__traits(compiles, { mixin(codeNativeUInt); }))
+        {
+            if (isType!NativeUIntType(typ))
+            {
+                mixin (codeNativeUInt);
+                return;
+            }
+        }
+
+        throw new InterpreterException("Dispatcher cannot deal with" ~ typ.name ~ " yet.");
+    }
+
+    private void unaryDispatcher(string fun)(Register r)
+    {
+        unaryDispatcher2!fun(r, NullType());
+    }
+
+    private struct BinaryContext(string fun)
+    {
+        enum string f = fun;
+        Register r2;
+    }
+
+    private struct BinaryResult(string fun, T)
+    {
+        enum string f = fun;
+        T* t;
+    }
+    
+    private void binaryWrapper2(Ctx, T)(T* t, Ctx res)
+    {
+        mixin(Ctx.f ~ "!(pointerTarget!(typeof(res.t)), T)(res.t, t);" );
+    }
+
+    private void binaryWrapper(Ctx, T)(T* t, Ctx r2) 
+    {
+        BinaryResult!(Ctx.f, T) res;
+        res.t = t;
+        unaryDispatcher2!("binaryWrapper2", typeof(res))(r2.r2, res);
+    } 
+
+    private void binaryDispatcher(string fun)(Register r1, Register r2)
+    {
+        BinaryContext!fun ctx;
+        ctx.r2 = r2;
+        unaryDispatcher2!("binaryWrapper", typeof(ctx))(r1, ctx);
     }
 
 
-    private void emulateALU(string op, bool binary)(Instruction inst)
+    private void doConv(T1, T2)(T1 *t1, T2 *t2)
     {
-        auto lhsType = inst.sourceRegister1.type;
-        auto lhsMem = _ctx.getValue(inst.sourceRegister1).data;
-        void* rhsMem = null;
-        auto dstMem = _ctx.getValue(inst.targetRegister).data;
+        writefln("conv " ~ T2.stringof ~ " [%s] -> " ~ T1.stringof, *t2);
+        *t1 = cast(T1)*t2;
+    }
 
-        static if (binary)
-            rhsMem = _ctx.getValue(inst.sourceRegister2).data;
-
-
+    private void emulateALU2(string op, bool binary)(Type lhsType, void *dstMem, void *lhsMem, void *rhsMem)
+    {
         if (isType!Int8Type(lhsType))
             return emulateALUForType!(byte, op, binary)(dstMem, lhsMem, rhsMem);
-        
+
         if (isType!UInt8Type(lhsType))
             return emulateALUForType!(ubyte, op, binary)(dstMem, lhsMem, rhsMem);
-        
+
         if (isType!Int16Type(lhsType))
             return emulateALUForType!(short, op, binary)(dstMem, lhsMem, rhsMem);
-        
+
         if (isType!UInt16Type(lhsType))
             return emulateALUForType!(ushort, op, binary)(dstMem, lhsMem, rhsMem);
-        
+
         if (isType!Int32Type(lhsType))
             return emulateALUForType!(int, op, binary)(dstMem, lhsMem, rhsMem);
-        
+
         if (isType!UInt32Type(lhsType))
             return emulateALUForType!(uint, op, binary)(dstMem, lhsMem, rhsMem);
-        
+
         if (isType!Int64Type(lhsType))
             return emulateALUForType!(long, op, binary)(dstMem, lhsMem, rhsMem);
-        
+
         if (isType!UInt64Type(lhsType))
             return emulateALUForType!(ulong, op, binary)(dstMem, lhsMem, rhsMem);
 
@@ -192,7 +370,41 @@ public final class Interpreter
         if (isType!NativeUIntType(lhsType))
             return emulateALUForType!(size_t, op, binary)(dstMem, lhsMem, rhsMem);
 
+
         throw new InterpreterException("ALU cannot emulate " ~ op ~ " for " ~ lhsType.name ~ " yet.");
+    }
+
+
+    private void emulateALU(string op, bool binary)(Instruction inst)
+    {
+        auto lhsType = inst.sourceRegister1.type;
+        auto lhsMem = cast(ubyte*)_ctx.getValue(inst.sourceRegister1).data;
+        ubyte* rhsMem = null;
+        auto dstMem = cast(ubyte*)_ctx.getValue(inst.targetRegister).data;
+
+        static if (binary)
+            rhsMem = cast(ubyte*)_ctx.getValue(inst.sourceRegister2).data;
+
+        if (auto vec = cast(VectorType)lhsType)
+        {
+            // all mem locs are pointers
+            dstMem = *cast(ubyte**)dstMem;
+            lhsMem = *cast(ubyte**)lhsMem;
+            rhsMem = *cast(ubyte**)rhsMem;
+
+            auto size = computeSize(vec.elementType, is32Bit);
+            for (auto i = 0; i < vec.elements; i++)
+            {
+                emulateALU2!(op, binary)(vec.elementType, dstMem, lhsMem, rhsMem);
+                dstMem += size;
+                lhsMem += size;
+                rhsMem += size;
+            }
+            
+        } else  
+            emulateALU2!(op, binary)(lhsType, dstMem, lhsMem, rhsMem);
+
+        
     }
 
     private RuntimeObject[] collectArgs()
@@ -210,6 +422,7 @@ public final class Interpreter
         return args;
     }
 
+    
     void step()
     {
         auto inst = _ctx.block.instructions[_ctx.instructionIndex++];
@@ -347,44 +560,44 @@ public final class Interpreter
                 _ctx.gotoEntry();
                 break;           
 
-            case OperationCode.add:
+            case OperationCode.ariAdd:
                 emulateALU!("+", true)(inst);
                 break;
 
-            case OperationCode.sub:
+            case OperationCode.ariSub:
                 emulateALU!("-", true)(inst);
                 break;
 
-            case OperationCode.mul:
+            case OperationCode.ariMul:
                 emulateALU!("*", true)(inst);
                 break;
 
-            case OperationCode.div:
+            case OperationCode.ariDiv:
                 emulateALU!("/", true)(inst);
                 break;
 
-            case OperationCode.rem:
+            case OperationCode.ariRem:
                 emulateALU!("%", true)(inst);
                 break;
 
-            case OperationCode.neg:
+            case OperationCode.ariNeg:
                 emulateALU!("-", false)(inst);
                 break;
 
-            case OperationCode.not:
-                emulateALU!("~", false)(inst);
-                break;
-
-            case OperationCode.and:
+            case OperationCode.bitAnd:
                 emulateALU!("&", true)(inst);
                 break;
 
-            case OperationCode.or:
+            case OperationCode.bitOr:
                 emulateALU!("|", true)(inst);
                 break;   
 
-            case OperationCode.xOr:
+            case OperationCode.bitXOr:
                 emulateALU!("^", true)(inst);
+                break;
+
+            case OperationCode.bitNeg:
+                emulateALU!("~", false)(inst);
                 break;
 
             case OperationCode.shL:
@@ -424,8 +637,27 @@ public final class Interpreter
                     auto arg = inst.sourceRegister1;
                     writeln( prettyPrint(arg.type, !is32Bit, _ctx.getValue(arg).data, arg.name ) );
                 } else
-                    goto default;
+                {
+                    binaryDispatcher!"doConv"(inst.targetRegister, inst.sourceRegister1);
+                }
                 break;
+
+            case OperationCode.arraySet:
+                {
+                    auto array = *cast(void**)_ctx.getValue(inst.sourceRegister1).data;
+                    auto index = *cast(size_t*)_ctx.getValue(inst.sourceRegister2).data;
+                    auto src   = _ctx.getValue(inst.sourceRegister3).data;
+                    auto typ = inst.sourceRegister1.type;
+                    uint size;
+
+                    if (auto vec = cast(VectorType)typ)
+                        size = computeSize(vec.elementType, is32Bit);
+                    else
+                        size = computeSize((cast(ArrayType)typ).elementType, is32Bit);
+
+                    memcpy(array + index * size, src, size);
+                    break;
+                }
 
 
             default:
