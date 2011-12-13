@@ -15,6 +15,7 @@ import mci.core.code.modules,
        mci.vm.memory.layout,
        mci.vm.memory.prettyprint,
        core.stdc.string,
+       std.c.stdlib,
        std.stdio,
        std.traits;
 
@@ -31,10 +32,16 @@ final class InterpreterContext
     private Dictionary!(Register, RuntimeObject) _registerState;
     private GarbageCollector _gc;
 
+
+    public void gotoBlock(BasicBlock b)
+    {
+        block = b;
+        instructionIndex = 0;
+    }
+
     public void gotoBlock(string name)
     {
-        block = fun.blocks[name];
-        instructionIndex = 0;
+        gotoBlock(fun.blocks[name]);        
     }
 
     public void gotoEntry()
@@ -69,6 +76,21 @@ final class InterpreterContext
         }
 
         gotoEntry();
+    }
+
+    public ubyte* arrayElement(Register arrayReg, Register indexReg, out uint size)
+    {
+        auto array = *cast(ubyte**)getValue(arrayReg).data;
+        auto index = *cast(size_t*)getValue(indexReg).data;
+
+        auto typ = arrayReg.type;
+
+        if (auto vec = cast(VectorType)typ)
+            size = computeSize(vec.elementType, is32Bit);
+        else
+            size = computeSize((cast(ArrayType)typ).elementType, is32Bit);
+
+        return array + index * size;
     }
 
     public void loadRegister(T)(Register reg, InstructionOperand value)
@@ -145,7 +167,7 @@ public final class Interpreter
 
 
     // highlevel D emulation of common ALU instuctions
-    private void emulateALUForType(T, string op, bool binary)(void* target, void* lhs, void* rhs)
+    private void emulateALUForType(T, string op, bool binary)(ubyte* target, ubyte* lhs, ubyte* rhs)
     {
         static if (binary)
             enum string code = "*cast(T*)target = cast(T)(*cast(T*)lhs " ~ op ~ " *cast(T*)rhs);";
@@ -335,7 +357,7 @@ public final class Interpreter
         *t1 = cast(T1)*t2;
     }
 
-    private void emulateALU2(string op, bool binary)(Type lhsType, void *dstMem, void *lhsMem, void *rhsMem)
+    private void emulateALU2(string op, bool binary)(Type lhsType, ubyte* dstMem, ubyte* lhsMem, ubyte* rhsMem)
     {
         if (isType!Int8Type(lhsType))
             return emulateALUForType!(byte, op, binary)(dstMem, lhsMem, rhsMem);
@@ -422,6 +444,23 @@ public final class Interpreter
         return args;
     }
 
+    private void allocate(Register target, size_t count)
+    {
+        auto dst = cast(ubyte**)_ctx.getValue(target).data;
+        auto elementType = (cast(PointerType)target.type).elementType;
+        auto elementSize = computeSize(elementType, is32Bit);
+        auto mem = cast(ubyte*)calloc(count, elementSize);
+        *dst = mem;
+    }
+
+    private void gcallocate(Register target, size_t count)
+    {
+        auto dst = cast(ubyte**)_ctx.getValue(target).data;
+        auto elementType = (cast(PointerType)target.type).elementType;
+        auto elementSize = computeSize(elementType, is32Bit);
+        auto mem = _gc.allocate(elementType, count * elementSize);
+        *dst = mem.data;
+    }
     
     void step()
     {
@@ -644,21 +683,63 @@ public final class Interpreter
 
             case OperationCode.arraySet:
                 {
-                    auto array = *cast(void**)_ctx.getValue(inst.sourceRegister1).data;
-                    auto index = *cast(size_t*)_ctx.getValue(inst.sourceRegister2).data;
                     auto src   = _ctx.getValue(inst.sourceRegister3).data;
-                    auto typ = inst.sourceRegister1.type;
                     uint size;
+                    auto dst = _ctx.arrayElement(inst.sourceRegister1, inst.sourceRegister2, size);
 
-                    if (auto vec = cast(VectorType)typ)
-                        size = computeSize(vec.elementType, is32Bit);
-                    else
-                        size = computeSize((cast(ArrayType)typ).elementType, is32Bit);
-
-                    memcpy(array + index * size, src, size);
+                    memcpy(dst, src, size);
                     break;
                 }
 
+            case OperationCode.jump:
+                _ctx.gotoBlock(*inst.operand.peek!BasicBlock);
+                break;
+                
+
+            case OperationCode.memAlloc:
+                auto count = *cast(size_t*)_ctx.getValue(inst.sourceRegister1).data;
+                allocate(inst.targetRegister, count);
+                break;
+
+            case OperationCode.memNew:
+                allocate(inst.targetRegister, 1);
+                break;
+
+            case OperationCode.memGCAlloc:
+                auto count = *cast(size_t*)_ctx.getValue(inst.sourceRegister1).data;
+                gcallocate(inst.targetRegister, count);
+                break;
+
+            case OperationCode.memGCNew:
+                gcallocate(inst.targetRegister, 1);
+                break;
+
+
+            case OperationCode.memSet:
+                auto size = computeSize(inst.sourceRegister2.type, is32Bit);
+                auto dst = *cast(ubyte**)_ctx.getValue(inst.sourceRegister1).data;
+                auto src = _ctx.getValue(inst.sourceRegister2).data;
+                memcpy(dst, src, size);
+                
+                break;
+
+            case OperationCode.memGet:
+                auto size = computeSize(inst.targetRegister.type, is32Bit);
+                auto src = *cast(ubyte**)_ctx.getValue(inst.sourceRegister1).data;
+                auto dst = _ctx.getValue(inst.targetRegister).data;
+                memcpy(dst, src, size);
+                break;
+
+            case OperationCode.memFree:
+                auto mem = *cast(ubyte**)_ctx.getValue(inst.sourceRegister1).data;
+                free(mem);
+                break;
+
+            case OperationCode.memGCFree:
+                auto mem = *cast(ubyte**)_ctx.getValue(inst.sourceRegister1).data;
+                auto rto = RuntimeObject.fromData(mem);
+                _gc.free(rto);
+                break;
 
             default:
                 throw new InterpreterException("Unsupported opcode: " ~ inst.opCode.name);
