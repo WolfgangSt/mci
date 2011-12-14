@@ -165,24 +165,6 @@ public final class Interpreter
         return false;
     }
 
-
-    // highlevel D emulation of common ALU instuctions
-    private void emulateALUForType(T, string op, bool binary)(ubyte* target, ubyte* lhs, ubyte* rhs)
-    {
-        static if (binary)
-            enum string code = "*cast(T*)target = cast(T)(*cast(T*)lhs " ~ op ~ " *cast(T*)rhs);";
-        else
-            enum string code = "*cast(T*)target = cast(T)(" ~ op ~ " *cast(T*)lhs); ";
-
-        static if (__traits(compiles, { mixin(code); }))
-        {
-            mixin(code);
-            return;
-        } 
-        else
-            throw new InterpreterException("Invalid operation: " ~ op ~ " for " ~ T.stringof);
-    }
-
     private struct NullType {};
 
     private void unaryDispatcher2(string fun, T = NullType)(Register r, T userData)
@@ -311,7 +293,17 @@ public final class Interpreter
             }
         }
 
-        throw new InterpreterException("Dispatcher cannot deal with" ~ typ.name ~ " yet.");
+        enum string codeNativeInt = fun ~ "!(" ~ arg ~ "isize_t)(cast(isize_t*)mem" ~ pass ~ ");";
+        static if (__traits(compiles, { mixin(codeNativeInt); }))
+        {
+            if (isType!NativeIntType(typ))
+            {
+                mixin (codeNativeUInt);
+                return;
+            }
+        }
+
+        throw new InterpreterException("Dispatcher cannot deal with " ~ typ.name ~ " yet.");
     }
 
     private void unaryDispatcher(string fun)(Register r)
@@ -357,41 +349,60 @@ public final class Interpreter
         *t1 = cast(T1)*t2;
     }
 
-    private void emulateALU2(string op, bool binary)(Type lhsType, ubyte* dstMem, ubyte* lhsMem, ubyte* rhsMem)
+    // highlevel D emulation of common ALU instuctions
+    private void emulateALUForType(T, string op, bool binary, string resultType)(ubyte* target, ubyte* lhs, ubyte* rhs)
+    {
+        static if (binary)
+            enum string code = "*cast(" ~ resultType ~ "*)target = cast(" ~ resultType ~ ")(*cast(T*)lhs " ~ op ~ " *cast(T*)rhs);";
+        else
+            enum string code = "*cast(" ~ resultType ~ "*)target = cast(" ~ resultType ~ ")(" ~ op ~ " *cast(T*)lhs); ";
+
+        static if (__traits(compiles, { mixin(code); }))
+        {
+            mixin(code);
+            return;
+        } 
+        else
+            throw new InterpreterException("Invalid operation: " ~ op ~ " for " ~ T.stringof);
+    }
+
+    private void emulateALU2(string op, bool binary, string resultType="T")(Type lhsType, ubyte* dstMem, ubyte* lhsMem, ubyte* rhsMem)
     {
         if (isType!Int8Type(lhsType))
-            return emulateALUForType!(byte, op, binary)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(byte, op, binary, resultType)(dstMem, lhsMem, rhsMem);
 
         if (isType!UInt8Type(lhsType))
-            return emulateALUForType!(ubyte, op, binary)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(ubyte, op, binary, resultType)(dstMem, lhsMem, rhsMem);
 
         if (isType!Int16Type(lhsType))
-            return emulateALUForType!(short, op, binary)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(short, op, binary, resultType)(dstMem, lhsMem, rhsMem);
 
         if (isType!UInt16Type(lhsType))
-            return emulateALUForType!(ushort, op, binary)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(ushort, op, binary, resultType)(dstMem, lhsMem, rhsMem);
 
         if (isType!Int32Type(lhsType))
-            return emulateALUForType!(int, op, binary)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(int, op, binary, resultType)(dstMem, lhsMem, rhsMem);
 
         if (isType!UInt32Type(lhsType))
-            return emulateALUForType!(uint, op, binary)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(uint, op, binary, resultType)(dstMem, lhsMem, rhsMem);
 
         if (isType!Int64Type(lhsType))
-            return emulateALUForType!(long, op, binary)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(long, op, binary, resultType)(dstMem, lhsMem, rhsMem);
 
         if (isType!UInt64Type(lhsType))
-            return emulateALUForType!(ulong, op, binary)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(ulong, op, binary, resultType)(dstMem, lhsMem, rhsMem);
 
         if (isType!Float32Type(lhsType))
-            return emulateALUForType!(float, op, binary)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(float, op, binary, resultType)(dstMem, lhsMem, rhsMem);
 
         if (isType!Float64Type(lhsType))
-            return emulateALUForType!(double, op, binary)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(double, op, binary, resultType)(dstMem, lhsMem, rhsMem);
 
         if (isType!NativeUIntType(lhsType))
-            return emulateALUForType!(size_t, op, binary)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(size_t, op, binary, resultType)(dstMem, lhsMem, rhsMem);
 
+        if (isType!NativeIntType(lhsType))
+            return emulateALUForType!(isize_t, op, binary, resultType)(dstMem, lhsMem, rhsMem);
 
         throw new InterpreterException("ALU cannot emulate " ~ op ~ " for " ~ lhsType.name ~ " yet.");
     }
@@ -400,9 +411,9 @@ public final class Interpreter
     private void emulateALU(string op, bool binary)(Instruction inst)
     {
         auto lhsType = inst.sourceRegister1.type;
-        auto lhsMem = cast(ubyte*)_ctx.getValue(inst.sourceRegister1).data;
+        auto lhsMem = _ctx.getValue(inst.sourceRegister1).data;
         ubyte* rhsMem = null;
-        auto dstMem = cast(ubyte*)_ctx.getValue(inst.targetRegister).data;
+        auto dstMem = _ctx.getValue(inst.targetRegister).data;
 
         static if (binary)
             rhsMem = cast(ubyte*)_ctx.getValue(inst.sourceRegister2).data;
@@ -422,12 +433,41 @@ public final class Interpreter
                 lhsMem += size;
                 rhsMem += size;
             }
-            
-        } else  
-            emulateALU2!(op, binary)(lhsType, dstMem, lhsMem, rhsMem);
 
-        
+        } else  
+            emulateALU2!(op, binary)(lhsType, dstMem, lhsMem, rhsMem);  
     }
+
+    private void emulateLogic(string op, bool binary)(Instruction inst)
+    {
+        auto lhsType = inst.sourceRegister1.type;
+        auto lhsMem = _ctx.getValue(inst.sourceRegister1).data;
+        ubyte* rhsMem = null;
+        auto dstMem = _ctx.getValue(inst.targetRegister).data;
+
+        static if (binary)
+            rhsMem = cast(ubyte*)_ctx.getValue(inst.sourceRegister2).data;
+
+        if (auto vec = cast(VectorType)lhsType)
+        {
+            // all mem locs are pointers
+            dstMem = *cast(ubyte**)dstMem;
+            lhsMem = *cast(ubyte**)lhsMem;
+            rhsMem = *cast(ubyte**)rhsMem;
+
+            auto size = computeSize(vec.elementType, is32Bit);
+            for (auto i = 0; i < vec.elements; i++)
+            {
+                emulateALU2!(op, binary, "size_t")(vec.elementType, dstMem, lhsMem, rhsMem);
+                dstMem += size_t.sizeof;
+                lhsMem += size;
+                rhsMem += size;
+            }
+
+        } else  
+            emulateALU2!(op, binary, "size_t")(lhsType, dstMem, lhsMem, rhsMem);  
+    }
+    
 
     private RuntimeObject[] collectArgs()
     {
@@ -446,20 +486,56 @@ public final class Interpreter
 
     private void allocate(Register target, size_t count)
     {
-        auto dst = cast(ubyte**)_ctx.getValue(target).data;
-        auto elementType = (cast(PointerType)target.type).elementType;
-        auto elementSize = computeSize(elementType, is32Bit);
-        auto mem = cast(ubyte*)calloc(count, elementSize);
-        *dst = mem;
+        if (auto typ = (cast(PointerType)target.type))
+        {
+            auto dst = cast(ubyte**)_ctx.getValue(target).data;
+            auto elementType = typ.elementType;
+            auto elementSize = computeSize(elementType, is32Bit);
+            auto mem = cast(ubyte*)calloc(count, elementSize);
+            *dst = mem;
+
+            return;
+        }
+
+        if (auto typ = (cast(ArrayType)target.type))
+        {
+            auto dst = cast(ubyte**)_ctx.getValue(target).data;
+            auto elementType = typ.elementType;
+            auto elementSize = computeSize(elementType, is32Bit);
+            auto mem = cast(ubyte*)calloc(count, elementSize);
+            *dst = mem;
+
+            return;
+        }
+
+        throw new InterpreterException("Unsupported allocate target: " ~ target.name);
     }
 
     private void gcallocate(Register target, size_t count)
     {
-        auto dst = cast(ubyte**)_ctx.getValue(target).data;
-        auto elementType = (cast(PointerType)target.type).elementType;
-        auto elementSize = computeSize(elementType, is32Bit);
-        auto mem = _gc.allocate(elementType, count * elementSize);
-        *dst = mem.data;
+        if (auto typ = (cast(PointerType)target.type))
+        {
+            auto dst = cast(ubyte**)_ctx.getValue(target).data;
+            auto elementType = typ.elementType;
+            auto elementSize = computeSize(elementType, is32Bit);
+            auto mem = _gc.allocate(elementType, count * elementSize);
+            *dst = mem.data;
+
+            return;
+        }
+
+        if (auto typ = (cast(ArrayType)target.type))
+        {
+            auto dst = cast(ubyte**)_ctx.getValue(target).data;
+            auto elementType = typ.elementType;
+            auto elementSize = computeSize(elementType, is32Bit);
+            auto mem = _gc.allocate(elementType, count * elementSize);
+            *dst = mem.data;
+
+            return;
+        }
+
+        throw new InterpreterException("Unsupported allocate target: " ~ target.name);
     }
     
     void step()
@@ -539,21 +615,48 @@ public final class Interpreter
 
 
             case OperationCode.fieldSet:
-                auto dest = inst.sourceRegister1;
-                auto source = inst.sourceRegister2;
+                auto dest = _ctx.getValue(inst.sourceRegister1).data;
+                auto source = _ctx.getValue(inst.sourceRegister2).data;
                 auto field = *inst.operand.peek!(Field);
                 auto offset = computeOffset(field, is32Bit);
                 auto size = computeSize(field.type, is32Bit);
-                _ctx.blockCopy(dest, source, offset, 0, size);
+                
+                if (isType!PointerType(inst.sourceRegister1.type))
+                    dest = *cast(ubyte**)dest;
+
+                dest += offset;
+                memcpy(dest, source, size);
+
                 break;
 
             case OperationCode.fieldGet:
-                auto dest = inst.targetRegister;
-                auto source = inst.sourceRegister1;
+                auto dest = _ctx.getValue(inst.targetRegister).data;
+                auto source = _ctx.getValue(inst.sourceRegister1).data;
                 auto field = *inst.operand.peek!(Field);
                 auto offset = computeOffset(field, is32Bit);
                 auto size = computeSize(field.type, is32Bit); 
-                _ctx.blockCopy(dest, source, 0, offset, size);
+
+                if (isType!PointerType(inst.sourceRegister1.type))
+                    source = *cast(ubyte**)source;
+
+                source += offset;
+                memcpy(dest, source, size);
+
+                break;
+
+            case OperationCode.fieldAddr:
+                auto dest = _ctx.getValue(inst.targetRegister).data;
+                auto source = _ctx.getValue(inst.sourceRegister1).data;
+                auto field = *inst.operand.peek!(Field);
+                auto offset = computeOffset(field, is32Bit);
+                auto size = computeSize(field.type, is32Bit); 
+
+                if (isType!PointerType(inst.sourceRegister1.type))
+                    source = *cast(ubyte**)source;
+
+                source += offset;
+                *cast(ubyte**)dest = source;
+
                 break;
                 
 
@@ -639,6 +742,10 @@ public final class Interpreter
                 emulateALU!("~", false)(inst);
                 break;
 
+            case OperationCode.not:
+                emulateALU!("!", false)(inst);
+                break;
+
             case OperationCode.shL:
                 emulateALU!("<<", true)(inst);
                 break;
@@ -674,9 +781,13 @@ public final class Interpreter
                 {
                     // debug instruction
                     auto arg = inst.sourceRegister1;
-                    writeln( prettyPrint(arg.type, !is32Bit, _ctx.getValue(arg).data, arg.name ) );
+                    writeln( prettyPrint(arg.type, is32Bit, _ctx.getValue(arg).data, arg.name ) );
                 } else
                 {
+                    // TODO: 
+                    // handle conversion from array to ptr
+                    // handle conversion from ptr to array
+
                     binaryDispatcher!"doConv"(inst.targetRegister, inst.sourceRegister1);
                 }
                 break;
@@ -688,6 +799,26 @@ public final class Interpreter
                     auto dst = _ctx.arrayElement(inst.sourceRegister1, inst.sourceRegister2, size);
 
                     memcpy(dst, src, size);
+                    break;
+                }
+
+            case OperationCode.arrayGet:
+                {
+                    auto dst   = _ctx.getValue(inst.targetRegister).data;
+                    uint size;
+                    auto src = _ctx.arrayElement(inst.sourceRegister1, inst.sourceRegister2, size);
+
+                    memcpy(dst, src, size);
+                    break;
+                }
+
+            case OperationCode.arrayAddr:
+                {
+                    auto dst   = _ctx.getValue(inst.targetRegister).data;
+                    uint size;
+                    auto src = _ctx.arrayElement(inst.sourceRegister1, inst.sourceRegister2, size);
+
+                    *cast(ubyte**)dst = src;
                     break;
                 }
 
@@ -739,6 +870,36 @@ public final class Interpreter
                 auto mem = *cast(ubyte**)_ctx.getValue(inst.sourceRegister1).data;
                 auto rto = RuntimeObject.fromData(mem);
                 _gc.free(rto);
+                break;
+
+            case OperationCode.memAddr:
+                auto mem = _ctx.getValue(inst.sourceRegister1).data;
+                auto dst = cast(ubyte**)_ctx.getValue(inst.targetRegister).data;
+                *dst = mem;
+                break;
+
+            case OperationCode.cmpEq:
+                emulateLogic!("==", true)(inst);
+                break;
+
+            case OperationCode.cmpNEq:
+                emulateLogic!("!=", true)(inst);
+                break;
+
+            case OperationCode.cmpGT:
+                emulateLogic!(">", true)(inst);
+                break;
+
+            case OperationCode.cmpLT:
+                emulateLogic!("<", true)(inst);
+                break;
+
+            case OperationCode.cmpGTEq:
+                emulateLogic!(">=", true)(inst);
+                break;
+
+            case OperationCode.cmpLTEq:
+                emulateLogic!("<=", true)(inst);
                 break;
 
             default:
