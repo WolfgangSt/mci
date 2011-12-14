@@ -165,7 +165,7 @@ public final class Interpreter
         return false;
     }
 
-    private struct NullType {};
+    struct NullType {};
 
     private void unaryDispatcher2(string fun, T = NullType)(Register r, T userData)
     {
@@ -825,8 +825,19 @@ public final class Interpreter
             case OperationCode.jump:
                 _ctx.gotoBlock(*inst.operand.peek!BasicBlock);
                 break;
-                
 
+            case OperationCode.jumpTrue:
+                auto value = *cast(size_t*)_ctx.getValue(inst.sourceRegister1).data;
+                if (value != 0)
+                     _ctx.gotoBlock(*inst.operand.peek!BasicBlock);
+                break;
+
+            case OperationCode.jumpFalse:
+                auto value = *cast(size_t*)_ctx.getValue(inst.sourceRegister1).data;
+                if (value == 0)
+                    _ctx.gotoBlock(*inst.operand.peek!BasicBlock);
+                break;
+      
             case OperationCode.memAlloc:
                 auto count = *cast(size_t*)_ctx.getValue(inst.sourceRegister1).data;
                 allocate(inst.targetRegister, count);
