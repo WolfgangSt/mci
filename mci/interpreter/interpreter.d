@@ -16,8 +16,10 @@ import mci.core.code.modules,
        mci.vm.memory.prettyprint,
        core.stdc.string,
        std.c.stdlib,
+       std.c.windows.windows,
        std.stdio,
-       std.traits;
+       std.traits,
+       std.utf;
 
 typedef void function() functionPointer;
 
@@ -95,7 +97,7 @@ final class InterpreterContext
 
     public void loadRegister(T)(Register reg, InstructionOperand value)
     {
-        auto src = value.peek!T;
+        auto src = value.peek!T();
         auto dst = cast(T*)_registerState[reg].data;
         *dst = *src;
     }
@@ -537,6 +539,28 @@ public final class Interpreter
 
         throw new InterpreterException("Unsupported allocate target: " ~ target.name);
     }
+
+    private void doFFI(Instruction inst)
+    {
+        auto sig = *inst.operand.peek!FFISignature();
+        auto libName = toUTFz!(const(wchar)*)(sig.library);
+        auto impName = toUTFz!(const(char)*)(sig.entryPoint);
+        // try GetModuleHandle first
+        auto lib = GetModuleHandleW(libName);
+        if (!lib)
+            lib = LoadLibraryW(libName);
+        auto fun = cast(FFIFunction)GetProcAddress(lib, impName);
+
+        auto argTypes = new FFIType[_numPushs];
+
+        // collect call data
+
+        ffiCall(fun, FFIType.ffiVoid, argTypes); 
+
+        _numPushs = 0;
+
+        writeln(sig);
+    }
     
     void step()
     {
@@ -609,7 +633,7 @@ public final class Interpreter
                 break;
 
             case OperationCode.loadSize:
-                auto size = computeSize(*inst.operand.peek!Type, is32Bit);
+                auto size = computeSize(*inst.operand.peek!Type(), is32Bit);
                 *cast(size_t*)_ctx.getValue(inst.targetRegister).data = size;
                 break;
 
@@ -617,7 +641,7 @@ public final class Interpreter
             case OperationCode.fieldSet:
                 auto dest = _ctx.getValue(inst.sourceRegister1).data;
                 auto source = _ctx.getValue(inst.sourceRegister2).data;
-                auto field = *inst.operand.peek!(Field);
+                auto field = *inst.operand.peek!Field();
                 auto offset = computeOffset(field, is32Bit);
                 auto size = computeSize(field.type, is32Bit);
                 
@@ -632,7 +656,7 @@ public final class Interpreter
             case OperationCode.fieldGet:
                 auto dest = _ctx.getValue(inst.targetRegister).data;
                 auto source = _ctx.getValue(inst.sourceRegister1).data;
-                auto field = *inst.operand.peek!(Field);
+                auto field = *inst.operand.peek!Field();
                 auto offset = computeOffset(field, is32Bit);
                 auto size = computeSize(field.type, is32Bit); 
 
@@ -647,7 +671,7 @@ public final class Interpreter
             case OperationCode.fieldAddr:
                 auto dest = _ctx.getValue(inst.targetRegister).data;
                 auto source = _ctx.getValue(inst.sourceRegister1).data;
-                auto field = *inst.operand.peek!(Field);
+                auto field = *inst.operand.peek!Field();
                 auto offset = computeOffset(field, is32Bit);
                 auto size = computeSize(field.type, is32Bit); 
 
@@ -670,7 +694,7 @@ public final class Interpreter
 
             case OperationCode.call:
             case OperationCode.invoke:
-                auto target = *inst.operand.peek!Function;
+                auto target = *inst.operand.peek!Function();
                 auto subContext = new InterpreterContext(target, _gc);
                 subContext.returnContext = _ctx;
                 subContext.args = collectArgs();
@@ -788,6 +812,30 @@ public final class Interpreter
                     // handle conversion from array to ptr
                     // handle conversion from ptr to array
 
+
+                    // Type 3 convert
+                    // T* -> U* for any T and any U.
+
+                    // Type 4 convert
+                    // T* -> T[] for any T.
+
+                    // Type 5 convert
+                    // T[] -> T* for any T.
+
+                    // Type 6 convert
+                    // T[E] -> U[E] for any valid T -> U conversion.
+
+
+                    // Direct conversions
+
+                    // Type 1 convert
+                    // T -> U for any primitives T and U (int8, uint8, int16, uint16, int32, uint32, int64, uint64, int, uint, float32, and float64).
+
+                    // Type 2 convert
+                    // T* -> uint or int for any T.
+
+                    // Type 7 convert
+                    // R(T1, ...) -> U* for any R, any amount and type of Tn, and any U.
                     binaryDispatcher!"doConv"(inst.targetRegister, inst.sourceRegister1);
                 }
                 break;
@@ -823,19 +871,19 @@ public final class Interpreter
                 }
 
             case OperationCode.jump:
-                _ctx.gotoBlock(*inst.operand.peek!BasicBlock);
+                _ctx.gotoBlock(*inst.operand.peek!BasicBlock());
                 break;
 
             case OperationCode.jumpTrue:
                 auto value = *cast(size_t*)_ctx.getValue(inst.sourceRegister1).data;
                 if (value != 0)
-                     _ctx.gotoBlock(*inst.operand.peek!BasicBlock);
+                     _ctx.gotoBlock(*inst.operand.peek!BasicBlock());
                 break;
 
             case OperationCode.jumpFalse:
                 auto value = *cast(size_t*)_ctx.getValue(inst.sourceRegister1).data;
                 if (value == 0)
-                    _ctx.gotoBlock(*inst.operand.peek!BasicBlock);
+                    _ctx.gotoBlock(*inst.operand.peek!BasicBlock());
                 break;
       
             case OperationCode.memAlloc:
@@ -911,6 +959,10 @@ public final class Interpreter
 
             case OperationCode.cmpLTEq:
                 emulateLogic!("<=", true)(inst);
+                break;
+
+            case OperationCode.ffi:
+                doFFI(inst);
                 break;
 
             default:
