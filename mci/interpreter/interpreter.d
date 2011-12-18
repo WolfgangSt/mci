@@ -1,6 +1,8 @@
 module mci.interpreter.interpreter;
 
-import mci.core.code.modules,
+import core.stdc.string,
+       ffi,
+       mci.core.code.modules,
        mci.core.common,
        mci.core.config,
        mci.core.container,
@@ -14,14 +16,19 @@ import mci.core.code.modules,
        mci.vm.memory.base,
        mci.vm.memory.layout,
        mci.vm.memory.prettyprint,
-       core.stdc.string,
        std.c.stdlib,
-       std.c.windows.windows,
        std.stdio,
        std.traits,
        std.utf;
 
-typedef void function() functionPointer;
+static if (operatingSystem == OperatingSystem.windows)
+{
+    import std.c.windows.windows;
+} 
+else
+{
+}
+
 
 final class InterpreterContext
 {
@@ -129,7 +136,7 @@ final class InterpreterContext
 
     public void releaseLocals()
     {
-        foreach (r; _registerState.values)
+        foreach (r; _registerState.values())
             _gc.free(r);
     }
 }
@@ -540,26 +547,135 @@ public final class Interpreter
         throw new InterpreterException("Unsupported allocate target: " ~ target.name);
     }
 
+    private FFIType* toFFIType(Type t)
+    {
+        if (t is null)
+            return FFIType.ffiVoid; // only valid as return type
+
+        if (isType!UInt8Type(t))
+            return FFIType.ffiUByte;
+
+        if (isType!Int8Type(t))
+            return FFIType.ffiByte;
+
+        if (isType!UInt16Type(t))
+            return FFIType.ffiUShort;
+
+        if (isType!Int16Type(t))
+            return FFIType.ffiShort;
+
+        if (isType!UInt32Type(t))
+            return FFIType.ffiUInt;
+
+        if (isType!Int32Type(t))
+            return FFIType.ffiInt;
+
+        if (isType!UInt64Type(t))
+            return FFIType.ffiULong;
+
+        if (isType!Int64Type(t))
+            return FFIType.ffiLong;
+
+        /*
+        // wait for FFI native types rather than do a is32Bit switch here
+        if (isType!NativeUIntType(lhsType))
+            return  
+
+        if (isType!NativeUIntType(lhsType))
+            return  
+        */
+
+        if (isType!Float32Type(t))
+            return FFIType.ffiFloat;
+
+        if (isType!Float64Type(t))
+            return FFIType.ffiDouble;
+
+        if (isType!PointerType(t))
+            return FFIType.ffiPointer;
+
+        throw new InterpreterException("Unsupported type for FFI: " ~ t.name);
+    }
+
+    private FFIInterface toFFIConvention(CallingConvention cc)
+    {
+        switch (cc)
+        {
+            case CallingConvention.cdecl:
+                return FFIInterface.platform;
+            case CallingConvention.stdCall:
+                return FFIInterface.stdCall;
+            default:
+                throw new InterpreterException("Unsupported calling convention");
+        }
+    }
+
+    private FFIFunction resolveEntrypoint(FFISignature sig)
+    {
+        static if (operatingSystem == OperatingSystem.windows)
+        {
+            import std.c.windows.windows;
+
+            auto libName = toUTFz!(const(wchar)*)(sig.library);
+            auto impName = toUTFz!(const(char)*)(sig.entryPoint);
+            // try GetModuleHandle first
+            auto lib = GetModuleHandleW(libName);
+            if (!lib)
+                lib = LoadLibraryW(libName);
+            return cast(FFIFunction)GetProcAddress(lib, impName);
+        }
+        else
+        {
+        }
+    }
+
     private void doFFI(Instruction inst)
     {
-        auto sig = *inst.operand.peek!FFISignature();
-        auto libName = toUTFz!(const(wchar)*)(sig.library);
-        auto impName = toUTFz!(const(char)*)(sig.entryPoint);
-        // try GetModuleHandle first
-        auto lib = GetModuleHandleW(libName);
-        if (!lib)
-            lib = LoadLibraryW(libName);
-        auto fun = cast(FFIFunction)GetProcAddress(lib, impName);
+        auto ffisig = *inst.operand.peek!FFISignature();
+        auto fptr = resolveEntrypoint(ffisig);
 
-        auto argTypes = new FFIType[_numPushs];
+        // by specification ffi is the only instruction in the block and
+        // the FFI signature corresponds to the current methods signature.
+        // The calling convention is specified with the FFI
 
-        // collect call data
+        auto fun = _ctx.fun;
 
-        ffiCall(fun, FFIType.ffiVoid, argTypes); 
+        auto returnType = toFFIType(fun.returnType);
+        auto params = fun.parameters;
+        auto argTypes = new FFIType*[params.count];
+        auto argMem = new void*[params.count];
+        ubyte[] returnMem = null;
+        uint returnSize = 0;
 
-        _numPushs = 0;
+        if (fun.returnType)
+        {
+            returnSize = computeSize(fun.returnType, is32Bit);
+            returnMem = new ubyte[returnSize];
+        }
+        auto cconv = toFFIConvention(ffisig.callingConvention);
+        
+        foreach (idx, p; params)
+        {
+            argTypes[idx] = toFFIType(p.type);
+            argMem[idx] = _ctx.args[idx].data;
+        }
+        
 
-        writeln(sig);
+        writeln("FFI invoke");
+        ffiCall(fptr, returnType, argTypes, returnMem.ptr, argMem, cconv); 
+
+        // finally return data
+        auto oldCtx = _ctx;
+        _ctx = _ctx.returnContext;
+
+        if (returnSize != 0)
+        {
+            auto callInst = _ctx.block.instructions[_ctx.instructionIndex - 1];
+            auto dst = _ctx.getValue(callInst.targetRegister).data;
+            memcpy(dst, returnMem.ptr, returnSize);
+        }
+
+        oldCtx.releaseLocals();
     }
     
     void step()
@@ -779,6 +895,7 @@ public final class Interpreter
                 break;
 
             case OperationCode.return_:
+                // this is most likeley bugged up... test!
                 auto src = _ctx.getValue(inst.sourceRegister1);
                 auto oldCtx = _ctx;
                 _ctx = _ctx.returnContext;
@@ -816,11 +933,20 @@ public final class Interpreter
                     // Type 3 convert
                     // T* -> U* for any T and any U.
 
-                    // Type 4 convert
+                    // Type 4 & 5 convert
                     // T* -> T[] for any T.
-
-                    // Type 5 convert
                     // T[] -> T* for any T.
+                    if ((isType!(PointerType)(inst.sourceRegister1.type) && isType!(ArrayType)(inst.targetRegister.type)) || 
+                        (isType!(ArrayType)(inst.sourceRegister1.type) && isType!(PointerType)(inst.targetRegister.type)))
+                    {
+                        // plain copy
+                        auto dst = _ctx.getValue(inst.targetRegister).data;
+                        auto src = _ctx.getValue(inst.sourceRegister1).data;
+                        *cast(ubyte**)dst = *cast(ubyte**)src;
+                        break;
+                    }
+
+                    
 
                     // Type 6 convert
                     // T[E] -> U[E] for any valid T -> U conversion.
