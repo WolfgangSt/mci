@@ -13,6 +13,7 @@ import core.stdc.string,
        mci.core.code.opcodes,
        mci.interpreter.exception,
        mci.core.code.instructions,
+       mci.vm.intrinsics.declarations,
        mci.vm.memory.base,
        mci.vm.memory.layout,
        mci.vm.memory.prettyprint,
@@ -59,7 +60,7 @@ final class InterpreterContext
         gotoBlock("entry");
     }
 
-    public this (Function f, GarbageCollector gc)
+    public this (Function f, GarbageCollector gc, bool jumpToEntry = true)
     {
         _gc = gc;
         fun = f;
@@ -81,11 +82,10 @@ final class InterpreterContext
                 writefln("  Allocating %s additional bytes for data", vecsize);
                 *cast(ubyte**)mem.data = (new ubyte[vecsize]).ptr;
             }
-
-            
         }
 
-        gotoEntry();
+        if (jumpToEntry)
+            gotoEntry();
     }
 
     public ubyte* arrayElement(Register arrayReg, Register indexReg, out uint size)
@@ -641,64 +641,73 @@ public final class Interpreter
         }
     }
 
+    private void dispatchFFI(Function fun, CallingConvention convention, FFIFunction entry, ubyte *returnMem)
+    {
+        auto params = fun.parameters;
+        auto returnType = toFFIType(fun.returnType);
+        auto argTypes = new FFIType*[params.count];
+        auto argMem = new void*[params.count];
+        auto cconv = toFFIConvention(convention);
+
+        foreach (idx, p; params)
+        {
+            argTypes[idx] = toFFIType(p.type);
+            argMem[idx] = _ctx.args[idx].data;
+        }
+
+        ffiCall(entry, returnType, argTypes, returnMem, argMem, cconv); 
+    }
+
     private void doFFI(Instruction inst)
     {
         auto ffisig = *inst.operand.peek!FFISignature();
         auto fptr = resolveEntrypoint(ffisig);
         
         if (fptr is null)
-        {
             throw new InterpreterException("Cannot resolve export " ~ ffisig.entryPoint ~ " in " ~ ffisig.library);
-        }
-
+        
         // by specification ffi is the only instruction in the block and
         // the FFI signature corresponds to the current methods signature.
         // The calling convention is specified with the FFI
 
         auto fun = _ctx.fun;
+        auto callCtx = _ctx.returnContext;
 
-        auto returnType = toFFIType(fun.returnType);
-        auto params = fun.parameters;
-        auto argTypes = new FFIType*[params.count];
-        auto argMem = new void*[params.count];
-        ubyte[] returnMem = null;
-        uint returnSize = 0;
-
-        if (fun.returnType)
+        ubyte *dst = null;
+        if (!(fun.returnType is null))
         {
-            returnSize = computeSize(fun.returnType, is32Bit);
-            returnMem = new ubyte[returnSize];
-        }
-        auto cconv = toFFIConvention(ffisig.callingConvention);
-        
-        foreach (idx, p; params)
-        {
-            argTypes[idx] = toFFIType(p.type);
-            argMem[idx] = _ctx.args[idx].data;
-        }
-        
-
-        writeln("FFI invoke");
-        ffiCall(fptr, returnType, argTypes, returnMem.ptr, argMem, cconv); 
-
-        // finally return data
-        auto oldCtx = _ctx;
-        _ctx = _ctx.returnContext;
-
-        if (returnSize != 0)
-        {
-            auto callInst = _ctx.block.instructions[_ctx.instructionIndex - 1];
-            auto dst = _ctx.getValue(callInst.targetRegister).data;
-            memcpy(dst, returnMem.ptr, returnSize);
+            auto callInst = callCtx.block.instructions[callCtx.instructionIndex - 1];
+            dst = callCtx.getValue(callInst.targetRegister).data;
         }
 
-        oldCtx.releaseLocals();
+        dispatchFFI(fun, ffisig.callingConvention, fptr, dst);  
+
+        _ctx.releaseLocals();
+        _ctx = callCtx;
+    }
+
+    private void doIntrinsic(Instruction inst)
+    {
+        auto intrinsic = *inst.operand.peek!Function();
+
+        auto callCtx = _ctx.returnContext;
+
+        ubyte *dst = null;
+        if (!(intrinsic.returnType is null))
+            dst = callCtx.getValue(inst.targetRegister).data;
+
+        auto fptr = intrinsicFunctions[intrinsic];
+
+        dispatchFFI(intrinsic, CallingConvention.cdecl, fptr, dst); 
+
+        _ctx.releaseLocals();
+        _ctx = callCtx;
     }
     
     void step()
     {
         auto inst = _ctx.block.instructions[_ctx.instructionIndex++];
-
+ 
         // unroll this using metacode if possible for readability
         switch (inst.opCode.code)
         {
@@ -828,10 +837,16 @@ public final class Interpreter
             case OperationCode.call:
             case OperationCode.invoke:
                 auto target = *inst.operand.peek!Function();
-                auto subContext = new InterpreterContext(target, _gc);
+
+                auto subContext = new InterpreterContext(target, _gc, false);
                 subContext.returnContext = _ctx;
                 subContext.args = collectArgs();
                 _ctx = subContext; 
+
+                if (target.attributes == FunctionAttributes.intrinsic)
+                    doIntrinsic(inst);
+                else _ctx.gotoEntry();
+
                 break;
 
             case OperationCode.callIndirect:
@@ -848,7 +863,6 @@ public final class Interpreter
                     subContext.returnContext = _ctx;
                     subContext.args = collectArgs();
                     _ctx = subContext; 
-
                 } else
                      throw new InterpreterException("Foreign Function Interfacing not supported yet");
                 break;
