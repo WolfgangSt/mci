@@ -19,6 +19,7 @@ import core.stdc.string,
        mci.vm.memory.prettyprint,
        std.c.stdlib,
        std.stdio,
+       std.string,
        std.traits,
        std.utf;
 
@@ -31,6 +32,11 @@ else
     import std.c.linux.linux;
 }
 
+final class InterpreterResult
+{
+    Type resultType;
+    RuntimeObject result;
+}
 
 final class InterpreterContext
 {
@@ -70,7 +76,7 @@ final class InterpreterContext
         {
             auto reg = namereg.y;
             auto size = computeSize(reg.type, is32Bit);
-            writefln("Allocating %s bytes %s for %s [%s]", size, reg.type.name, reg.name, cast(void*)reg);
+            //writefln("Allocating %s bytes %s for %s [%s]", size, reg.type.name, reg.name, cast(void*)reg);
 
             auto mem = gc.allocate(reg.type, size);
             _registerState.add(reg, mem);
@@ -79,7 +85,7 @@ final class InterpreterContext
             {
                 // allocate vector data as well
                 auto vecsize = computeSize(vec.elementType, is32Bit) * vec.elements;
-                writefln("  Allocating %s additional bytes for data", vecsize);
+                //writefln("  Allocating %s additional bytes for data", vecsize);
                 *cast(ubyte**)mem.data = (new ubyte[vecsize]).ptr;
             }
         }
@@ -148,31 +154,37 @@ public final class Interpreter
     private InterpreterContext _ctx;
 	private GarbageCollector _gc;
     private int _numPushs;
+    private Dictionary!(Type, FFIType*) _ffiStructTypeCache;
 
     public this(GarbageCollector collector)
     {
 		_gc = collector;
+        _ffiStructTypeCache = new Dictionary!(Type, FFIType*);
     }
 
-    public void interpret(Module mod)
+    public InterpreterResult interpret(Module mod)
     in
     {
         assert(mod);
+    }
+    out (result)
+    {
+        assert(result);
     }
     body
     {
         {
             auto main = mod.functions["main"];
             if (checkEntrySignature(main))
-                runFunction(main);
+                return runFunction(main);
+            throw new InterpreterException("No entrypoint found");
         }
     }
 
+    // remove once its part of the validator
     bool checkEntrySignature(Function fun)
     {
-        if (!fun.returnType)
-            return fun.parameters.empty;
-        return false;
+        return fun.parameters.empty;
     }
 
     struct NullType {};
@@ -355,7 +367,7 @@ public final class Interpreter
 
     private void doConv(T1, T2)(T1 *t1, T2 *t2)
     {
-        writefln("conv " ~ T2.stringof ~ " [%s] -> " ~ T1.stringof, *t2);
+        //writefln("conv " ~ T2.stringof ~ " [%s] -> " ~ T1.stringof, *t2);
         *t1 = cast(T1)*t2;
     }
 
@@ -595,6 +607,22 @@ public final class Interpreter
         if (isType!PointerType(t))
             return FFIType.ffiPointer;
 
+        if (auto struc = cast(StructureType)t)
+        {
+            auto cache = _ffiStructTypeCache.get(t);
+            if (!(cache is null))
+                return *cache;
+
+            // build a new ffi type
+            auto subTypes = new FFIType*[struc.fields.count];
+            foreach (idx, field; struc.fields)
+                subTypes[idx] = toFFIType(field.y.type);
+
+            auto newItem = new FFIType(subTypes);
+            _ffiStructTypeCache.add(t, newItem);
+            return newItem;
+        }
+
         throw new InterpreterException("Unsupported type for FFI: " ~ t.name);
     }
 
@@ -702,8 +730,8 @@ public final class Interpreter
 
         _ctx.releaseLocals();
         _ctx = callCtx;
-    }
-    
+    }    
+
     void step()
     {
         auto inst = _ctx.block.instructions[_ctx.instructionIndex++];
@@ -1127,13 +1155,52 @@ public final class Interpreter
         }
     }
 
-
-    void runFunction(Function fun)
+    InterpreterResult runFunction(Function fun)
     {
-        auto context = new InterpreterContext(fun, _gc);
+        Register resultReg = null;
+        if (!(fun.returnType is null))
+        {
+            // we need to wrap this function in order to retrieve the final return value
+            // this is for sake of performance as otherwise we had to check for a "final"
+            // return each time when interpreting a return op
 
+            auto name = "main_wrapper";
+            auto idx = 0;
+            while (!(fun.module_.functions.get(name) is null))
+            {
+                name = "main_wrapper_" ~ format(idx);
+                idx++;
+            }
+
+            auto wrapper = new Function(fun.module_, name, null);
+            resultReg = wrapper.createRegister("result", fun.returnType);
+            auto entry = wrapper.createBasicBlock("entry");
+            Register noReg = null;
+            entry.instructions.add(new Instruction(opCall, InstructionOperand(fun), resultReg, noReg, noReg, noReg));
+            entry.instructions.add(new Instruction(opLeave, InstructionOperand(), noReg, noReg, noReg, noReg));
+
+            fun = wrapper;
+        }
+
+
+        // run
+        auto context = new InterpreterContext(fun, _gc);
         _ctx = context;
         while (_ctx)
             step();
+
+        auto result = new InterpreterResult();
+
+        if (!(resultReg is null))
+        {
+            // evaluate result
+            result.resultType = resultReg.type;
+            result.result = context.getValue(resultReg);
+
+            writeln("The program quitted with:");
+            writeln( prettyPrint( result.resultType, is32Bit, result.result.data, "(return value)" ) );
+        }
+
+        return result;
     }
 }
