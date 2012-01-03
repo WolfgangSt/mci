@@ -7,6 +7,7 @@ import core.stdc.string,
        mci.core.config,
        mci.core.container,
        mci.core.code.functions,
+       mci.core.tuple,
        mci.core.typing.core,
        mci.core.typing.members,
        mci.core.typing.types,
@@ -344,7 +345,7 @@ public final class Interpreter
         enum string f = fun;
         T* t;
     }
-    
+
     private void binaryWrapper2(Ctx, T)(T* t, Ctx res)
     {
         mixin(Ctx.f ~ "!(pointerTarget!(typeof(res.t)), T)(res.t, t);" );
@@ -489,13 +490,13 @@ public final class Interpreter
         } else  
             emulateALU2!(op, binary, "size_t")(lhsType, dstMem, lhsMem, rhsMem);  
     }
-    
+
 
     private RuntimeObject[] collectArgs()
     {
         if (_numPushs == 0)
             return null;
-        
+
         auto args = new RuntimeObject[_numPushs];
         for (auto i = 0; i < _numPushs; i++)
         {
@@ -592,10 +593,10 @@ public final class Interpreter
         /*
         // wait for FFI native types rather than do a is32Bit switch here
         if (isType!NativeUIntType(lhsType))
-            return  
+        return  
 
         if (isType!NativeUIntType(lhsType))
-            return  
+        return  
         */
 
         if (isType!Float32Type(t))
@@ -632,11 +633,11 @@ public final class Interpreter
         {
             case CallingConvention.cdecl:
                 return FFIInterface.platform;
-            static if (operatingSystem == OperatingSystem.windows)
-            {
-            case CallingConvention.stdCall:
-                return FFIInterface.stdCall;
-            }
+                static if (operatingSystem == OperatingSystem.windows)
+                {
+                    case CallingConvention.stdCall:
+                        return FFIInterface.stdCall;
+                }
             default:
                 throw new InterpreterException("Unsupported calling convention");
         }
@@ -690,10 +691,10 @@ public final class Interpreter
     {
         auto ffisig = *inst.operand.peek!FFISignature();
         auto fptr = resolveEntrypoint(ffisig);
-        
+
         if (fptr is null)
             throw new InterpreterException("Cannot resolve export " ~ ffisig.entryPoint ~ " in " ~ ffisig.library);
-        
+
         // by specification ffi is the only instruction in the block and
         // the FFI signature corresponds to the current methods signature.
         // The calling convention is specified with the FFI
@@ -735,7 +736,7 @@ public final class Interpreter
     void step()
     {
         auto inst = _ctx.block.instructions[_ctx.instructionIndex++];
- 
+
         // unroll this using metacode if possible for readability
         switch (inst.opCode.code)
         {
@@ -814,7 +815,7 @@ public final class Interpreter
                 auto field = *inst.operand.peek!Field();
                 auto offset = computeOffset(field, is32Bit);
                 auto size = computeSize(field.type, is32Bit);
-                
+
                 if (isType!PointerType(inst.sourceRegister1.type))
                     dest = *cast(ubyte**)dest;
 
@@ -852,7 +853,7 @@ public final class Interpreter
                 *cast(ubyte**)dest = source;
 
                 break;
-                
+
 
             case OperationCode.argPush:
                 _numPushs++;
@@ -892,7 +893,7 @@ public final class Interpreter
                     subContext.args = collectArgs();
                     _ctx = subContext; 
                 } else
-                     throw new InterpreterException("Foreign Function Interfacing not supported yet");
+                    throw new InterpreterException("Foreign Function Interfacing not supported yet");
                 break;
 
             case OperationCode.callTail:
@@ -1005,7 +1006,7 @@ public final class Interpreter
                         break;
                     }
 
-                    
+
 
                     // Type 6 convert
                     // T[E] -> U[E] for any valid T -> U conversion.
@@ -1059,18 +1060,15 @@ public final class Interpreter
                 _ctx.gotoBlock(*inst.operand.peek!BasicBlock());
                 break;
 
-            case OperationCode.jumpTrue:
+            case OperationCode.jumpCond:
                 auto value = *cast(size_t*)_ctx.getValue(inst.sourceRegister1).data;
+                auto goals = *inst.operand.peek!(Tuple!(BasicBlock, BasicBlock))();
                 if (value != 0)
-                     _ctx.gotoBlock(*inst.operand.peek!BasicBlock());
+                    _ctx.gotoBlock(goals.x);
+                else 
+                    _ctx.gotoBlock(goals.y);
                 break;
 
-            case OperationCode.jumpFalse:
-                auto value = *cast(size_t*)_ctx.getValue(inst.sourceRegister1).data;
-                if (value == 0)
-                    _ctx.gotoBlock(*inst.operand.peek!BasicBlock());
-                break;
-      
             case OperationCode.memAlloc:
                 auto count = *cast(size_t*)_ctx.getValue(inst.sourceRegister1).data;
                 allocate(inst.targetRegister, count);
@@ -1095,7 +1093,7 @@ public final class Interpreter
                 auto dst = *cast(ubyte**)_ctx.getValue(inst.sourceRegister1).data;
                 auto src = _ctx.getValue(inst.sourceRegister2).data;
                 memcpy(dst, src, size);
-                
+
                 break;
 
             case OperationCode.memGet:
