@@ -149,18 +149,24 @@ final class InterpreterContext
     }
 }
 
+private class ClosureInfo
+{
+    FFIFunction fun;
+}
 
 public final class Interpreter
 {
     private InterpreterContext _ctx;
-	private GarbageCollector _gc;
+    private GarbageCollector _gc;
     private int _numPushs;
     private Dictionary!(Type, FFIType*) _ffiStructTypeCache;
+    private Dictionary!(Function, ClosureInfo) _closureCache;
 
     public this(GarbageCollector collector)
     {
-		_gc = collector;
+        _gc = collector;
         _ffiStructTypeCache = new Dictionary!(Type, FFIType*);
+        _closureCache = new Dictionary!(Function, ClosureInfo);
     }
 
     public InterpreterResult interpret(Module mod)
@@ -446,7 +452,8 @@ public final class Interpreter
             // all mem locs are pointers
             dstMem = *cast(ubyte**)dstMem;
             lhsMem = *cast(ubyte**)lhsMem;
-            rhsMem = *cast(ubyte**)rhsMem;
+            static if (binary)
+                rhsMem = *cast(ubyte**)rhsMem;
 
             auto size = computeSize(vec.elementType, is32Bit);
             for (auto i = 0; i < vec.elements; i++)
@@ -590,14 +597,17 @@ public final class Interpreter
         if (isType!Int64Type(t))
             return FFIType.ffiLong;
 
-        /*
-        // wait for FFI native types rather than do a is32Bit switch here
-        if (isType!NativeUIntType(lhsType))
-        return  
+        
+        // replace with FFI native types rather than is32Bit switch here
+        // as soon they are available
+        if (isType!NativeIntType(t))
+            return is32Bit ? FFIType.ffiInt : FFIType.ffiLong;
 
-        if (isType!NativeUIntType(lhsType))
-        return  
-        */
+        if (isType!NativeUIntType(t))
+            return is32Bit ? FFIType.ffiUInt : FFIType.ffiULong;
+
+
+
 
         if (isType!Float32Type(t))
             return FFIType.ffiFloat;
@@ -606,6 +616,9 @@ public final class Interpreter
             return FFIType.ffiDouble;
 
         if (isType!PointerType(t))
+            return FFIType.ffiPointer;
+
+        if (isType!FunctionPointerType(t))
             return FFIType.ffiPointer;
 
         if (auto struc = cast(StructureType)t)
@@ -670,6 +683,61 @@ public final class Interpreter
         }
     }
 
+    private Function toFunction(ubyte *mem)
+    {
+        auto fun = cast(Function)(*cast(ubyte**)mem);
+
+        // TODO:
+        // unfortunatley D wont validate the above cast, so we have to do this ourself here
+        // by walking over all currently loaded functions.
+        // at the moment we assume it always is a Function
+        //
+        // use the XRefVisitor to collect all funcs during startup and check fun against them
+        
+        return fun;
+    }
+
+
+    private ubyte* getParamMem(ubyte* mem, Type t)
+    {
+        if (auto fptr = cast(FunctionPointerType)t)
+        {
+            // the supplied argument is either a native function pointer to a function
+            // or a pointer to a Function object in the latter case we need to
+            // create a trampoline to the emulator
+
+            if (auto fun = toFunction(mem))
+            {
+                auto cache = _closureCache.get(fun);
+                if (!(cache is null))
+                    return cast(ubyte*)&cache.fun;
+
+                // need a trampoline
+                auto params = fptr.parameterTypes;
+                auto returnType = toFFIType(fptr.returnType);
+                auto argTypes = new FFIType*[params.count];
+
+                foreach (idx, p; params)
+                    argTypes[idx] = toFFIType(p);
+
+                auto trampoline = delegate void(void* ret, void** args) 
+                { 
+                    writefln("Trampoline fired!"); 
+                };
+
+                auto cconv = toFFIConvention(fptr.callingConvention);
+                auto closure = ffiClosure(trampoline, returnType, argTypes, cconv);
+                auto info = new ClosureInfo();
+                info.fun = closure.function_;
+
+                _closureCache.add(fun, info);
+                return cast(ubyte*)&info.fun;
+            }
+            return mem;
+        }
+        return mem;
+    }
+
     private void dispatchFFI(Function fun, CallingConvention convention, FFIFunction entry, ubyte *returnMem)
     {
         auto params = fun.parameters;
@@ -681,7 +749,7 @@ public final class Interpreter
         foreach (idx, p; params)
         {
             argTypes[idx] = toFFIType(p.type);
-            argMem[idx] = _ctx.args[idx].data;
+            argMem[idx] = getParamMem(_ctx.args[idx].data, p.type);
         }
 
         ffiCall(entry, returnType, argTypes, returnMem, argMem, cconv); 
@@ -709,7 +777,7 @@ public final class Interpreter
             dst = callCtx.getValue(callInst.targetRegister).data;
         }
 
-        dispatchFFI(fun, ffisig.callingConvention, fptr, dst);  
+        dispatchFFI(fun, fun.callingConvention, fptr, dst);  
 
         _ctx.releaseLocals();
         _ctx = callCtx;
