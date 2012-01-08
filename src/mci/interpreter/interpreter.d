@@ -45,10 +45,12 @@ final class InterpreterContext
     public BasicBlock block;
     public int instructionIndex;
     public InterpreterContext returnContext;
+    public RuntimeObject returnMem;
     public RuntimeObject[] args;
     public int _argIndex;
     private Dictionary!(Register, RuntimeObject) _registerState;
-    private GarbageCollector _gc;
+    private int _numPushs;
+    private Interpreter _interpreter;
 
 
     public void gotoBlock(BasicBlock b)
@@ -67,9 +69,9 @@ final class InterpreterContext
         gotoBlock("entry");
     }
 
-    public this (Function f, GarbageCollector gc, bool jumpToEntry = true)
+    public this (Function f, Interpreter interpreter, bool jumpToEntry = true)
     {
-        _gc = gc;
+        _interpreter = interpreter;
         fun = f;
 
         _registerState = new Dictionary!(Register, RuntimeObject)();
@@ -79,7 +81,7 @@ final class InterpreterContext
             auto size = computeSize(reg.type, is32Bit);
             //writefln("Allocating %s bytes %s for %s [%s]", size, reg.type.name, reg.name, cast(void*)reg);
 
-            auto mem = gc.allocate(reg.type, size);
+            auto mem = _interpreter.gcallocate(reg.type, size);
             _registerState.add(reg, mem);
 
             if (auto vec = cast(VectorType)reg.type)
@@ -145,60 +147,14 @@ final class InterpreterContext
     public void releaseLocals()
     {
         foreach (r; _registerState.values())
-            _gc.free(r);
-    }
-}
-
-private class ClosureInfo
-{
-    FFIFunction fun;
-}
-
-public final class Interpreter
-{
-    private InterpreterContext _ctx;
-    private GarbageCollector _gc;
-    private int _numPushs;
-    private Dictionary!(Type, FFIType*) _ffiStructTypeCache;
-    private Dictionary!(Function, ClosureInfo) _closureCache;
-
-    public this(GarbageCollector collector)
-    {
-        _gc = collector;
-        _ffiStructTypeCache = new Dictionary!(Type, FFIType*);
-        _closureCache = new Dictionary!(Function, ClosureInfo);
-    }
-
-    public InterpreterResult interpret(Module mod)
-    in
-    {
-        assert(mod);
-    }
-    out (result)
-    {
-        assert(result);
-    }
-    body
-    {
-        {
-            auto main = mod.functions["main"];
-            if (checkEntrySignature(main))
-                return runFunction(main);
-            throw new InterpreterException("No entrypoint found");
-        }
-    }
-
-    // remove once its part of the validator
-    bool checkEntrySignature(Function fun)
-    {
-        return fun.parameters.empty;
+            _interpreter.gcfree(r);
     }
 
     struct NullType {};
 
     private void unaryDispatcher2(string fun, T = NullType)(Register r, T userData)
     {
-        auto mem = _ctx.getValue(r).data;
+        auto mem = getValue(r).data;
         auto typ = r.type;
 
         static if (is(T == NullType))
@@ -332,6 +288,16 @@ public final class Interpreter
             }
         }
 
+        enum string codePointer = fun ~ "!(" ~ arg ~ "void*)(cast(void**)mem" ~ pass ~ ");";
+        static if (__traits(compiles, { mixin(codePointer); }))
+        {
+            if (isType!PointerType(typ))
+            {
+                mixin (codePointer);
+                return;
+            }
+        }
+
         throw new InterpreterException("Dispatcher cannot deal with " ~ typ.name ~ " yet.");
     }
 
@@ -440,12 +406,12 @@ public final class Interpreter
     private void emulateALU(string op, bool binary)(Instruction inst)
     {
         auto lhsType = inst.sourceRegister1.type;
-        auto lhsMem = _ctx.getValue(inst.sourceRegister1).data;
+        auto lhsMem = getValue(inst.sourceRegister1).data;
         ubyte* rhsMem = null;
-        auto dstMem = _ctx.getValue(inst.targetRegister).data;
+        auto dstMem = getValue(inst.targetRegister).data;
 
         static if (binary)
-            rhsMem = cast(ubyte*)_ctx.getValue(inst.sourceRegister2).data;
+            rhsMem = cast(ubyte*)getValue(inst.sourceRegister2).data;
 
         if (auto vec = cast(VectorType)lhsType)
         {
@@ -471,12 +437,12 @@ public final class Interpreter
     private void emulateLogic(string op, bool binary)(Instruction inst)
     {
         auto lhsType = inst.sourceRegister1.type;
-        auto lhsMem = _ctx.getValue(inst.sourceRegister1).data;
+        auto lhsMem = getValue(inst.sourceRegister1).data;
         ubyte* rhsMem = null;
-        auto dstMem = _ctx.getValue(inst.targetRegister).data;
+        auto dstMem = getValue(inst.targetRegister).data;
 
         static if (binary)
-            rhsMem = cast(ubyte*)_ctx.getValue(inst.sourceRegister2).data;
+            rhsMem = cast(ubyte*)getValue(inst.sourceRegister2).data;
 
         if (auto vec = cast(VectorType)lhsType)
         {
@@ -507,18 +473,65 @@ public final class Interpreter
         auto args = new RuntimeObject[_numPushs];
         for (auto i = 0; i < _numPushs; i++)
         {
-            auto reg = _ctx.block.instructions[_ctx.instructionIndex - _numPushs - 1 + i].sourceRegister1;
-            args[i] = _ctx.getValue(reg);
+            auto reg = block.instructions[instructionIndex - _numPushs - 1 + i].sourceRegister1;
+            args[i] = getValue(reg);
         }
         _numPushs = 0;
         return args;
     }
 
+    private void doIntrinsic(Instruction inst)
+    {
+        auto intrinsic = *inst.operand.peek!Function();
+
+        auto callCtx = returnContext;
+
+        ubyte *dst = null;
+        if (!(intrinsic.returnType is null))
+            dst = callCtx.getValue(inst.targetRegister).data;
+
+        auto fptr = intrinsicFunctions[intrinsic];
+
+        _interpreter.dispatchFFI(intrinsic, CallingConvention.cdecl, fptr, dst, args); 
+
+        releaseLocals();
+        switchToContext(callCtx);
+    }
+
+
+    private void doFFI(Instruction inst)
+    {
+        auto ffisig = *inst.operand.peek!FFISignature();
+        auto fptr = _interpreter.resolveEntrypoint(ffisig);
+
+        if (fptr is null)
+            throw new InterpreterException("Cannot resolve export " ~ ffisig.entryPoint ~ " in " ~ ffisig.library);
+
+        // by specification ffi is the only instruction in the block and
+        // the FFI signature corresponds to the current methods signature.
+        // The calling convention is specified with the FFI
+
+        auto callCtx = returnContext;
+
+        ubyte *dst = null;
+        if (!(fun.returnType is null))
+        {
+            auto callInst = callCtx.block.instructions[callCtx.instructionIndex - 1];
+            dst = callCtx.getValue(callInst.targetRegister).data;
+        }
+
+        _interpreter.dispatchFFI(fun, fun.callingConvention, fptr, dst, args);  
+
+        releaseLocals();
+        switchToContext(callCtx);
+    }
+
+
     private void allocate(Register target, size_t count)
     {
         if (auto typ = (cast(PointerType)target.type))
         {
-            auto dst = cast(ubyte**)_ctx.getValue(target).data;
+            auto dst = cast(ubyte**)getValue(target).data;
             auto elementType = typ.elementType;
             auto elementSize = computeSize(elementType, is32Bit);
             auto mem = cast(ubyte*)calloc(count, elementSize);
@@ -529,7 +542,7 @@ public final class Interpreter
 
         if (auto typ = (cast(ArrayType)target.type))
         {
-            auto dst = cast(ubyte**)_ctx.getValue(target).data;
+            auto dst = cast(ubyte**)getValue(target).data;
             auto elementType = typ.elementType;
             auto elementSize = computeSize(elementType, is32Bit);
             auto mem = cast(ubyte*)calloc(count, elementSize);
@@ -545,10 +558,10 @@ public final class Interpreter
     {
         if (auto typ = (cast(PointerType)target.type))
         {
-            auto dst = cast(ubyte**)_ctx.getValue(target).data;
+            auto dst = cast(ubyte**)getValue(target).data;
             auto elementType = typ.elementType;
             auto elementSize = computeSize(elementType, is32Bit);
-            auto mem = _gc.allocate(elementType, count * elementSize);
+            auto mem = _interpreter.gcallocate(elementType, count * elementSize);
             *dst = mem.data;
 
             return;
@@ -556,10 +569,10 @@ public final class Interpreter
 
         if (auto typ = (cast(ArrayType)target.type))
         {
-            auto dst = cast(ubyte**)_ctx.getValue(target).data;
+            auto dst = cast(ubyte**)getValue(target).data;
             auto elementType = typ.elementType;
             auto elementSize = computeSize(elementType, is32Bit);
-            auto mem = _gc.allocate(elementType, count * elementSize);
+            auto mem = _interpreter.gcallocate(elementType, count * elementSize);
             *dst = mem.data;
 
             return;
@@ -568,242 +581,16 @@ public final class Interpreter
         throw new InterpreterException("Unsupported allocate target: " ~ target.name);
     }
 
-    private FFIType* toFFIType(Type t)
+    @property public bool ready()
     {
-        if (t is null)
-            return FFIType.ffiVoid; // only valid as return type
-
-        if (isType!UInt8Type(t))
-            return FFIType.ffiUByte;
-
-        if (isType!Int8Type(t))
-            return FFIType.ffiByte;
-
-        if (isType!UInt16Type(t))
-            return FFIType.ffiUShort;
-
-        if (isType!Int16Type(t))
-            return FFIType.ffiShort;
-
-        if (isType!UInt32Type(t))
-            return FFIType.ffiUInt;
-
-        if (isType!Int32Type(t))
-            return FFIType.ffiInt;
-
-        if (isType!UInt64Type(t))
-            return FFIType.ffiULong;
-
-        if (isType!Int64Type(t))
-            return FFIType.ffiLong;
-
-        
-        // replace with FFI native types rather than is32Bit switch here
-        // as soon they are available
-        if (isType!NativeIntType(t))
-            return is32Bit ? FFIType.ffiInt : FFIType.ffiLong;
-
-        if (isType!NativeUIntType(t))
-            return is32Bit ? FFIType.ffiUInt : FFIType.ffiULong;
-
-
-
-
-        if (isType!Float32Type(t))
-            return FFIType.ffiFloat;
-
-        if (isType!Float64Type(t))
-            return FFIType.ffiDouble;
-
-        if (isType!PointerType(t))
-            return FFIType.ffiPointer;
-
-        if (isType!FunctionPointerType(t))
-            return FFIType.ffiPointer;
-
-        if (auto struc = cast(StructureType)t)
-        {
-            auto cache = _ffiStructTypeCache.get(t);
-            if (!(cache is null))
-                return *cache;
-
-            // build a new ffi type
-            auto subTypes = new FFIType*[struc.fields.count];
-            foreach (idx, field; struc.fields)
-                subTypes[idx] = toFFIType(field.y.type);
-
-            auto newItem = new FFIType(subTypes);
-            _ffiStructTypeCache.add(t, newItem);
-            return newItem;
-        }
-
-        throw new InterpreterException("Unsupported type for FFI: " ~ t.name);
+        return instructionIndex < block.instructions.count;
     }
 
-    private FFIInterface toFFIConvention(CallingConvention cc)
+    public void step()
     {
-        switch (cc)
-        {
-            case CallingConvention.cdecl:
-                return FFIInterface.platform;
-                static if (operatingSystem == OperatingSystem.windows)
-                {
-                    case CallingConvention.stdCall:
-                        return FFIInterface.stdCall;
-                }
-            default:
-                throw new InterpreterException("Unsupported calling convention");
-        }
-    }
+        auto inst = block.instructions[instructionIndex++];
 
-    private FFIFunction resolveEntrypoint(FFISignature sig)
-    {
-        static if (operatingSystem == OperatingSystem.windows)
-        {
-            import std.c.windows.windows;
-
-            auto libName = toUTFz!(const(wchar)*)(sig.library);
-            auto impName = toUTFz!(const(char)*)(sig.entryPoint);
-            // try GetModuleHandle first
-            auto lib = GetModuleHandleW(libName);
-            if (!lib)
-                lib = LoadLibraryW(libName);
-            return cast(FFIFunction)GetProcAddress(lib, impName);
-        }
-        else
-        {
-            auto libName = toUTFz!(const(char)*)(sig.library);
-            auto impName = toUTFz!(const(char)*)(sig.entryPoint);
-            //auto lib = dlopen(libName, RTLD_NOLOAD);
-
-            //if (lib is null)
-            auto    lib = dlopen(libName, RTLD_LOCAL);
-
-            return cast(FFIFunction)dlsym(lib, impName);
-        }
-    }
-
-    private Function toFunction(ubyte *mem)
-    {
-        auto fun = cast(Function)(*cast(ubyte**)mem);
-
-        // TODO:
-        // unfortunatley D wont validate the above cast, so we have to do this ourself here
-        // by walking over all currently loaded functions.
-        // at the moment we assume it always is a Function
-        //
-        // use the XRefVisitor to collect all funcs during startup and check fun against them
-        
-        return fun;
-    }
-
-
-    private ubyte* getParamMem(ubyte* mem, Type t)
-    {
-        if (auto fptr = cast(FunctionPointerType)t)
-        {
-            // the supplied argument is either a native function pointer to a function
-            // or a pointer to a Function object in the latter case we need to
-            // create a trampoline to the emulator
-
-            if (auto fun = toFunction(mem))
-            {
-                auto cache = _closureCache.get(fun);
-                if (!(cache is null))
-                    return cast(ubyte*)&cache.fun;
-
-                // need a trampoline
-                auto params = fptr.parameterTypes;
-                auto returnType = toFFIType(fptr.returnType);
-                auto argTypes = new FFIType*[params.count];
-
-                foreach (idx, p; params)
-                    argTypes[idx] = toFFIType(p);
-
-                auto trampoline = delegate void(void* ret, void** args) 
-                { 
-                    writefln("Trampoline fired!"); 
-                };
-
-                auto cconv = toFFIConvention(fptr.callingConvention);
-                auto closure = ffiClosure(trampoline, returnType, argTypes, cconv);
-                auto info = new ClosureInfo();
-                info.fun = closure.function_;
-
-                _closureCache.add(fun, info);
-                return cast(ubyte*)&info.fun;
-            }
-            return mem;
-        }
-        return mem;
-    }
-
-    private void dispatchFFI(Function fun, CallingConvention convention, FFIFunction entry, ubyte *returnMem)
-    {
-        auto params = fun.parameters;
-        auto returnType = toFFIType(fun.returnType);
-        auto argTypes = new FFIType*[params.count];
-        auto argMem = new void*[params.count];
-        auto cconv = toFFIConvention(convention);
-
-        foreach (idx, p; params)
-        {
-            argTypes[idx] = toFFIType(p.type);
-            argMem[idx] = getParamMem(_ctx.args[idx].data, p.type);
-        }
-
-        ffiCall(entry, returnType, argTypes, returnMem, argMem, cconv); 
-    }
-
-    private void doFFI(Instruction inst)
-    {
-        auto ffisig = *inst.operand.peek!FFISignature();
-        auto fptr = resolveEntrypoint(ffisig);
-
-        if (fptr is null)
-            throw new InterpreterException("Cannot resolve export " ~ ffisig.entryPoint ~ " in " ~ ffisig.library);
-
-        // by specification ffi is the only instruction in the block and
-        // the FFI signature corresponds to the current methods signature.
-        // The calling convention is specified with the FFI
-
-        auto fun = _ctx.fun;
-        auto callCtx = _ctx.returnContext;
-
-        ubyte *dst = null;
-        if (!(fun.returnType is null))
-        {
-            auto callInst = callCtx.block.instructions[callCtx.instructionIndex - 1];
-            dst = callCtx.getValue(callInst.targetRegister).data;
-        }
-
-        dispatchFFI(fun, fun.callingConvention, fptr, dst);  
-
-        _ctx.releaseLocals();
-        _ctx = callCtx;
-    }
-
-    private void doIntrinsic(Instruction inst)
-    {
-        auto intrinsic = *inst.operand.peek!Function();
-
-        auto callCtx = _ctx.returnContext;
-
-        ubyte *dst = null;
-        if (!(intrinsic.returnType is null))
-            dst = callCtx.getValue(inst.targetRegister).data;
-
-        auto fptr = intrinsicFunctions[intrinsic];
-
-        dispatchFFI(intrinsic, CallingConvention.cdecl, fptr, dst); 
-
-        _ctx.releaseLocals();
-        _ctx = callCtx;
-    }    
-
-    void step()
-    {
-        auto inst = _ctx.block.instructions[_ctx.instructionIndex++];
+        //writefln("%s.%s: %s", block.name, instructionIndex, inst.toString());
 
         // unroll this using metacode if possible for readability
         switch (inst.opCode.code)
@@ -821,65 +608,65 @@ public final class Interpreter
                 break;
 
             case OperationCode.loadI8:
-                _ctx.loadRegister!byte(inst.targetRegister, inst.operand);
+                loadRegister!byte(inst.targetRegister, inst.operand);
                 break;
 
             case OperationCode.loadUI8:
-                _ctx.loadRegister!ubyte(inst.targetRegister, inst.operand);
+                loadRegister!ubyte(inst.targetRegister, inst.operand);
                 break;
 
             case OperationCode.loadI16:
-                _ctx.loadRegister!short(inst.targetRegister, inst.operand);
+                loadRegister!short(inst.targetRegister, inst.operand);
                 break;
 
             case OperationCode.loadUI16:
-                _ctx.loadRegister!ushort(inst.targetRegister, inst.operand);
+                loadRegister!ushort(inst.targetRegister, inst.operand);
                 break;
 
             case OperationCode.loadI32:
-                _ctx.loadRegister!int(inst.targetRegister, inst.operand);
+                loadRegister!int(inst.targetRegister, inst.operand);
                 break;
 
             case OperationCode.loadUI32:
-                _ctx.loadRegister!uint(inst.targetRegister, inst.operand);
+                loadRegister!uint(inst.targetRegister, inst.operand);
                 break;
 
             case OperationCode.loadI64:
-                _ctx.loadRegister!long(inst.targetRegister, inst.operand);
+                loadRegister!long(inst.targetRegister, inst.operand);
                 break;
 
             case OperationCode.loadUI64:
-                _ctx.loadRegister!ulong(inst.targetRegister, inst.operand);
+                loadRegister!ulong(inst.targetRegister, inst.operand);
                 break;
 
             case OperationCode.loadF32:
-                _ctx.loadRegister!float(inst.targetRegister, inst.operand);
+                loadRegister!float(inst.targetRegister, inst.operand);
                 break;
 
             case OperationCode.loadF64:
-                _ctx.loadRegister!double(inst.targetRegister, inst.operand);
+                loadRegister!double(inst.targetRegister, inst.operand);
                 break;
 
             case OperationCode.loadFunc:
                 // this assumes that a Function (ref) fits into a function pointer
-                _ctx.loadRegister!Function(inst.targetRegister, inst.operand);
+                loadRegister!Function(inst.targetRegister, inst.operand);
                 break;
 
             case OperationCode.loadNull:
-                auto obj = _ctx.getValue(inst.targetRegister);
+                auto obj = getValue(inst.targetRegister);
                 auto sz = computeSize(inst.targetRegister.type, is32Bit);
                 memset(obj.data, 0, sz);
                 break;
 
             case OperationCode.loadSize:
                 auto size = computeSize(*inst.operand.peek!Type(), is32Bit);
-                *cast(size_t*)_ctx.getValue(inst.targetRegister).data = size;
+                *cast(size_t*)getValue(inst.targetRegister).data = size;
                 break;
 
 
             case OperationCode.fieldSet:
-                auto dest = _ctx.getValue(inst.sourceRegister1).data;
-                auto source = _ctx.getValue(inst.sourceRegister2).data;
+                auto dest = getValue(inst.sourceRegister1).data;
+                auto source = getValue(inst.sourceRegister2).data;
                 auto field = *inst.operand.peek!Field();
                 auto offset = computeOffset(field, is32Bit);
                 auto size = computeSize(field.type, is32Bit);
@@ -893,8 +680,8 @@ public final class Interpreter
                 break;
 
             case OperationCode.fieldGet:
-                auto dest = _ctx.getValue(inst.targetRegister).data;
-                auto source = _ctx.getValue(inst.sourceRegister1).data;
+                auto dest = getValue(inst.targetRegister).data;
+                auto source = getValue(inst.sourceRegister1).data;
                 auto field = *inst.operand.peek!Field();
                 auto offset = computeOffset(field, is32Bit);
                 auto size = computeSize(field.type, is32Bit); 
@@ -908,8 +695,8 @@ public final class Interpreter
                 break;
 
             case OperationCode.fieldAddr:
-                auto dest = _ctx.getValue(inst.targetRegister).data;
-                auto source = _ctx.getValue(inst.sourceRegister1).data;
+                auto dest = getValue(inst.targetRegister).data;
+                auto source = getValue(inst.sourceRegister1).data;
                 auto field = *inst.operand.peek!Field();
                 auto offset = computeOffset(field, is32Bit);
                 auto size = computeSize(field.type, is32Bit); 
@@ -928,46 +715,51 @@ public final class Interpreter
                 break; // emulation of push is deferred till call instruction
 
             case OperationCode.argPop:
-                _ctx.popArg(inst.targetRegister);
+                popArg(inst.targetRegister);
                 break;
 
             case OperationCode.call:
             case OperationCode.invoke:
                 auto target = *inst.operand.peek!Function();
 
-                auto subContext = new InterpreterContext(target, _gc, false);
-                subContext.returnContext = _ctx;
+                auto subContext = new InterpreterContext(target, _interpreter, false);
+                subContext.returnContext = this;
+                if (inst.opCode.code == OperationCode.call)
+                    subContext.returnMem = getValue(inst.targetRegister);
                 subContext.args = collectArgs();
-                _ctx = subContext; 
 
                 if (target.attributes == FunctionAttributes.intrinsic)
-                    doIntrinsic(inst);
-                else _ctx.gotoEntry();
+                    subContext.doIntrinsic(inst);
+                else 
+                {
+                    subContext.gotoEntry();
+                    switchToContext(subContext);
+                }
 
                 break;
 
             case OperationCode.callIndirect:
             case OperationCode.invokeIndirect:
                 auto funType = cast(FunctionPointerType)inst.sourceRegister1.type;
-                auto funPtr = _ctx.getValue(inst.sourceRegister1).data;
+                auto funPtr = getValue(inst.sourceRegister1).data;
 
                 // TODO: impl this check as soon zor added the functionality
                 //if (funType.callingConvention == CallingConvention.queueCall)
                 if (true)
                 {
                     auto target = *cast(Function*)funPtr;
-                    auto subContext = new InterpreterContext(target, _gc);
-                    subContext.returnContext = _ctx;
+                    auto subContext = new InterpreterContext(target, _interpreter);
+                    subContext.returnContext = this;
                     subContext.args = collectArgs();
-                    _ctx = subContext; 
+                    switchToContext(subContext);
                 } else
                     throw new InterpreterException("Foreign Function Interfacing not supported yet");
                 break;
 
             case OperationCode.callTail:
             case OperationCode.invokeTail:
-                _ctx.args = collectArgs();
-                _ctx.gotoEntry();
+                args = collectArgs();
+                gotoEntry();
                 break;           
 
             case OperationCode.ariAdd:
@@ -1023,26 +815,23 @@ public final class Interpreter
                 break;
 
             case OperationCode.return_:
-                // this is most likeley bugged up... test!
-                auto src = _ctx.getValue(inst.sourceRegister1);
-                auto oldCtx = _ctx;
-                _ctx = _ctx.returnContext;
+                auto src = getValue(inst.sourceRegister1);
 
-                auto callInst = _ctx.block.instructions[_ctx.instructionIndex - 1];
+                //auto callInst = returnContext.block.instructions[returnContext.instructionIndex - 1];
+                //auto dst = returnContext.getValue(callInst.targetRegister);
+                //auto size = computeSize(callInst.targetRegister.type, is32Bit);
+                
+                auto size = computeSize(returnMem.type, is32Bit);
+                blockCopy(returnMem, src, 0, 0, size);
 
-                auto dst = _ctx.getValue(callInst.targetRegister);
-                auto size = computeSize(callInst.targetRegister.type, is32Bit);
-                _ctx.blockCopy(dst, src, 0, 0, size);
-
-                oldCtx.releaseLocals();
+                releaseLocals();
+                switchToContext(returnContext);
 
                 break;
 
             case OperationCode.leave:
-                auto oldCtx = _ctx;
-                _ctx = _ctx.returnContext;
-
-                oldCtx.releaseLocals();
+                switchToContext(returnContext);
+                releaseLocals();
                 break;
 
             case OperationCode.conv:
@@ -1050,7 +839,7 @@ public final class Interpreter
                 {
                     // debug instruction
                     auto arg = inst.sourceRegister1;
-                    writeln( prettyPrint(arg.type, is32Bit, _ctx.getValue(arg).data, arg.name ) );
+                    writeln( prettyPrint(arg.type, is32Bit, getValue(arg).data, arg.name ) );
                 } else
                 {
                     // TODO: 
@@ -1068,8 +857,8 @@ public final class Interpreter
                         (isType!(ArrayType)(inst.sourceRegister1.type) && isType!(PointerType)(inst.targetRegister.type)))
                     {
                         // plain copy
-                        auto dst = _ctx.getValue(inst.targetRegister).data;
-                        auto src = _ctx.getValue(inst.sourceRegister1).data;
+                        auto dst = getValue(inst.targetRegister).data;
+                        auto src = getValue(inst.sourceRegister1).data;
                         *cast(ubyte**)dst = *cast(ubyte**)src;
                         break;
                     }
@@ -1096,9 +885,9 @@ public final class Interpreter
 
             case OperationCode.arraySet:
                 {
-                    auto src   = _ctx.getValue(inst.sourceRegister3).data;
+                    auto src   = getValue(inst.sourceRegister3).data;
                     uint size;
-                    auto dst = _ctx.arrayElement(inst.sourceRegister1, inst.sourceRegister2, size);
+                    auto dst = arrayElement(inst.sourceRegister1, inst.sourceRegister2, size);
 
                     memcpy(dst, src, size);
                     break;
@@ -1106,9 +895,9 @@ public final class Interpreter
 
             case OperationCode.arrayGet:
                 {
-                    auto dst   = _ctx.getValue(inst.targetRegister).data;
+                    auto dst   = getValue(inst.targetRegister).data;
                     uint size;
-                    auto src = _ctx.arrayElement(inst.sourceRegister1, inst.sourceRegister2, size);
+                    auto src = arrayElement(inst.sourceRegister1, inst.sourceRegister2, size);
 
                     memcpy(dst, src, size);
                     break;
@@ -1116,29 +905,29 @@ public final class Interpreter
 
             case OperationCode.arrayAddr:
                 {
-                    auto dst   = _ctx.getValue(inst.targetRegister).data;
+                    auto dst   = getValue(inst.targetRegister).data;
                     uint size;
-                    auto src = _ctx.arrayElement(inst.sourceRegister1, inst.sourceRegister2, size);
+                    auto src = arrayElement(inst.sourceRegister1, inst.sourceRegister2, size);
 
                     *cast(ubyte**)dst = src;
                     break;
                 }
 
             case OperationCode.jump:
-                _ctx.gotoBlock(*inst.operand.peek!BasicBlock());
+                gotoBlock(*inst.operand.peek!BasicBlock());
                 break;
 
             case OperationCode.jumpCond:
-                auto value = *cast(size_t*)_ctx.getValue(inst.sourceRegister1).data;
+                auto value = *cast(size_t*)getValue(inst.sourceRegister1).data;
                 auto goals = *inst.operand.peek!(Tuple!(BasicBlock, BasicBlock))();
                 if (value != 0)
-                    _ctx.gotoBlock(goals.x);
+                    gotoBlock(goals.x);
                 else 
-                    _ctx.gotoBlock(goals.y);
+                    gotoBlock(goals.y);
                 break;
 
             case OperationCode.memAlloc:
-                auto count = *cast(size_t*)_ctx.getValue(inst.sourceRegister1).data;
+                auto count = *cast(size_t*)getValue(inst.sourceRegister1).data;
                 allocate(inst.targetRegister, count);
                 break;
 
@@ -1147,7 +936,7 @@ public final class Interpreter
                 break;
 
             case OperationCode.memGCAlloc:
-                auto count = *cast(size_t*)_ctx.getValue(inst.sourceRegister1).data;
+                auto count = *cast(size_t*)getValue(inst.sourceRegister1).data;
                 gcallocate(inst.targetRegister, count);
                 break;
 
@@ -1158,33 +947,33 @@ public final class Interpreter
 
             case OperationCode.memSet:
                 auto size = computeSize(inst.sourceRegister2.type, is32Bit);
-                auto dst = *cast(ubyte**)_ctx.getValue(inst.sourceRegister1).data;
-                auto src = _ctx.getValue(inst.sourceRegister2).data;
+                auto dst = *cast(ubyte**)getValue(inst.sourceRegister1).data;
+                auto src = getValue(inst.sourceRegister2).data;
                 memcpy(dst, src, size);
 
                 break;
 
             case OperationCode.memGet:
                 auto size = computeSize(inst.targetRegister.type, is32Bit);
-                auto src = *cast(ubyte**)_ctx.getValue(inst.sourceRegister1).data;
-                auto dst = _ctx.getValue(inst.targetRegister).data;
+                auto src = *cast(ubyte**)getValue(inst.sourceRegister1).data;
+                auto dst = getValue(inst.targetRegister).data;
                 memcpy(dst, src, size);
                 break;
 
             case OperationCode.memFree:
-                auto mem = *cast(ubyte**)_ctx.getValue(inst.sourceRegister1).data;
+                auto mem = *cast(ubyte**)getValue(inst.sourceRegister1).data;
                 free(mem);
                 break;
 
             case OperationCode.memGCFree:
-                auto mem = *cast(ubyte**)_ctx.getValue(inst.sourceRegister1).data;
+                auto mem = *cast(ubyte**)getValue(inst.sourceRegister1).data;
                 auto rto = RuntimeObject.fromData(mem);
-                _gc.free(rto);
+                _interpreter.gcfree(rto);
                 break;
 
             case OperationCode.memAddr:
-                auto mem = _ctx.getValue(inst.sourceRegister1).data;
-                auto dst = cast(ubyte**)_ctx.getValue(inst.targetRegister).data;
+                auto mem = getValue(inst.sourceRegister1).data;
+                auto dst = cast(ubyte**)getValue(inst.targetRegister).data;
                 *dst = mem;
                 break;
 
@@ -1220,53 +1009,331 @@ public final class Interpreter
                 throw new InterpreterException("Unsupported opcode: " ~ inst.opCode.name);
         }
     }
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+// shared data
+
+private __gshared Dictionary!(Type, FFIType*) ffiStructTypeCache;
+
+shared static this() 
+{
+    ffiStructTypeCache = new Dictionary!(Type, FFIType*);
+}
+
+private FFIType* toFFIType(Type t)
+{
+    if (t is null)
+        return FFIType.ffiVoid; // only valid as return type
+
+    if (isType!UInt8Type(t))
+        return FFIType.ffiUByte;
+
+    if (isType!Int8Type(t))
+        return FFIType.ffiByte;
+
+    if (isType!UInt16Type(t))
+        return FFIType.ffiUShort;
+
+    if (isType!Int16Type(t))
+        return FFIType.ffiShort;
+
+    if (isType!UInt32Type(t))
+        return FFIType.ffiUInt;
+
+    if (isType!Int32Type(t))
+        return FFIType.ffiInt;
+
+    if (isType!UInt64Type(t))
+        return FFIType.ffiULong;
+
+    if (isType!Int64Type(t))
+        return FFIType.ffiLong;
+
+    // replace with FFI native types rather than is32Bit switch here
+    // as soon they are available
+    if (isType!NativeIntType(t))
+        return is32Bit ? FFIType.ffiInt : FFIType.ffiLong;
+
+    if (isType!NativeUIntType(t))
+        return is32Bit ? FFIType.ffiUInt : FFIType.ffiULong;
+
+    if (isType!Float32Type(t))
+        return FFIType.ffiFloat;
+
+    if (isType!Float64Type(t))
+        return FFIType.ffiDouble;
+
+    if (isType!PointerType(t))
+        return FFIType.ffiPointer;
+
+    if (isType!FunctionPointerType(t))
+        return FFIType.ffiPointer;
+
+    if (auto struc = cast(StructureType)t)
+    {
+        synchronized(ffiStructTypeCache)
+        {
+            auto cache = ffiStructTypeCache.get(t);
+            if (!(cache is null))
+                return *cache;
+
+            // build a new ffi type
+            auto subTypes = new FFIType*[struc.fields.count];
+            foreach (idx, field; struc.fields)
+                subTypes[idx] = toFFIType(field.y.type);
+
+            auto newItem = new FFIType(subTypes);
+            ffiStructTypeCache.add(t, newItem);
+            return newItem;
+        }
+    }
+
+    throw new InterpreterException("Unsupported type for FFI: " ~ t.name);
+}
+
+private FFIInterface toFFIConvention(CallingConvention cc)
+{
+    switch (cc)
+    {
+        case CallingConvention.cdecl:
+            return FFIInterface.platform;
+            static if (operatingSystem == OperatingSystem.windows)
+            {
+                case CallingConvention.stdCall:
+                    return FFIInterface.stdCall;
+            }
+        default:
+            throw new InterpreterException("Unsupported calling convention");
+    }
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+// per thread data
+
+private InterpreterContext currentContext;
+
+private void step()
+{
+    currentContext.step();
+}
+
+private void run()
+{
+    while (!(currentContext is null) && currentContext.ready)
+        currentContext.step();
+}
+
+private void switchToContext(InterpreterContext context)
+{
+    currentContext = context;
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+// interpreter helper
+
+public final class Interpreter
+{
+    private GarbageCollector _gc;
+    private Dictionary!(Function, FFIClosure) _closureCache;
+    
+
+    public this(GarbageCollector collector)
+    {
+        _gc = collector;
+        _closureCache = new Dictionary!(Function, FFIClosure);
+    }
+
+    public InterpreterResult interpret(Module mod)
+    in
+    {
+        assert(mod);
+    }
+    out (result)
+    {
+        assert(result);
+    }
+    body
+    {
+        {
+            auto main = mod.functions["main"];
+            return runFunction(main);
+        }
+    }
+
+    private FFIClosure getClosure(Function function_)
+    {
+        auto cache = _closureCache.get(function_);
+        if (!(cache is null))
+            return *cache;
+
+        // need a trampoline
+        auto params = function_.parameters;
+        auto returnType = toFFIType(function_.returnType);
+        auto argTypes = new FFIType*[params.count];
+
+        foreach (idx, p; params)
+            argTypes[idx] = toFFIType(p.type);
+
+
+        // careful trampolines actually consume stack
+        auto trampoline = delegate void(void* ret, void** args) 
+        { 
+            writefln("Trampoline fired!");
+
+          
+            // marshall data
+            auto context = new InterpreterContext(function_, this);
+            context.args = new RuntimeObject[params.count];
+            foreach (idx, p; params)
+            {
+                auto size = computeSize(p.type, is32Bit);
+                auto arg = gcallocate(p.type, size);
+                memcpy(arg.data, args[idx], size);
+                context.args[idx] = arg;
+            }
+
+            // if data is to be returned, allocate mem
+            auto returnType = function_.returnType;
+            uint returnSize = 0;
+            if (!(returnType is null))
+            {
+                returnSize = computeSize(returnType, is32Bit);
+                context.returnMem = gcallocate(returnType, returnSize);
+            }
+
+            // run
+            switchToContext(context);
+            run();
+
+            // marshall and free up
+            foreach (arg; context.args)
+                gcfree(arg);
+
+            if (!(returnType is null))
+            {
+                memcpy(ret, context.returnMem.data, returnSize);
+                gcfree(context.returnMem);
+            }
+
+            context.releaseLocals();
+        };
+
+        auto cconv = toFFIConvention(function_.callingConvention);
+        auto closure = ffiClosure(trampoline, returnType, argTypes, cconv);
+
+        _closureCache.add(function_, closure);
+        return closure;
+    }
+
+
+    public RuntimeObject gcallocate(Type t, uint size)
+    {
+        return _gc.allocate(t, size);
+    }
+
+    public void gcfree(RuntimeObject r)
+    {
+        _gc.free(r);
+    }
+
+    public FFIFunction resolveEntrypoint(FFISignature sig)
+    {
+        static if (operatingSystem == OperatingSystem.windows)
+        {
+            import std.c.windows.windows;
+
+            auto libName = toUTFz!(const(wchar)*)(sig.library);
+            auto impName = toUTFz!(const(char)*)(sig.entryPoint);
+            // try GetModuleHandle first
+            auto lib = GetModuleHandleW(libName);
+            if (!lib)
+                lib = LoadLibraryW(libName);
+            return cast(FFIFunction)GetProcAddress(lib, impName);
+        }
+        else
+        {
+            auto libName = toUTFz!(const(char)*)(sig.library);
+            auto impName = toUTFz!(const(char)*)(sig.entryPoint);
+            //auto lib = dlopen(libName, RTLD_NOLOAD);
+
+            //if (lib is null)
+            auto    lib = dlopen(libName, RTLD_LOCAL);
+
+            return cast(FFIFunction)dlsym(lib, impName);
+        }
+    }
+
+    private Function toFunction(ubyte *mem)
+    {
+        auto fun = cast(Function)(*cast(ubyte**)mem);
+
+        // TODO:
+        // unfortunatley D wont validate the above cast, so we have to do this ourself here
+        // by walking over all currently loaded functions.
+        // at the moment we assume it always is a Function
+        //
+        // use the XRefVisitor to collect all funcs during startup and check fun against them
+        
+        return fun;
+    }
+
+
+    private ubyte* getParamMem(ubyte* mem, Type t)
+    {
+        if (auto fptr = cast(FunctionPointerType)t)
+        {
+            // the supplied argument is either a native function pointer to a function
+            // or a pointer to a Function object in the latter case we need to
+            // create a trampoline to the emulator
+
+            if (auto fun = toFunction(mem))
+                return cast(ubyte*)getClosure(fun).function_;
+            
+            return mem;
+        }
+        return mem;
+    }
+
+    public void dispatchFFI(Function fun, CallingConvention convention, FFIFunction entry, ubyte *returnMem, RuntimeObject[] args)
+    {
+        auto params = fun.parameters;
+        auto returnType = toFFIType(fun.returnType);
+        auto argTypes = new FFIType*[params.count];
+        auto argMem = new void*[params.count];
+        auto cconv = toFFIConvention(convention);
+
+        foreach (idx, p; params)
+        {
+            argTypes[idx] = toFFIType(p.type);
+            argMem[idx] = getParamMem(args[idx].data, p.type);
+        }
+
+        ffiCall(entry, returnType, argTypes, returnMem, argMem, cconv); 
+    }
 
     InterpreterResult runFunction(Function fun)
     {
-        Register resultReg = null;
-        if (!(fun.returnType is null))
-        {
-            // we need to wrap this function in order to retrieve the final return value
-            // this is for sake of performance as otherwise we had to check for a "final"
-            // return each time when interpreting a return op
-
-            auto name = "main_wrapper";
-            auto idx = 0;
-            while (!(fun.module_.functions.get(name) is null))
-            {
-                name = "main_wrapper_" ~ format(idx);
-                idx++;
-            }
-
-            auto wrapper = new Function(fun.module_, name, null);
-            resultReg = wrapper.createRegister("result", fun.returnType);
-            auto entry = wrapper.createBasicBlock("entry");
-            Register noReg = null;
-            entry.instructions.add(new Instruction(opCall, InstructionOperand(fun), resultReg, noReg, noReg, noReg));
-            entry.instructions.add(new Instruction(opLeave, InstructionOperand(), noReg, noReg, noReg, noReg));
-
-            fun = wrapper;
-        }
-
-
-        // run
-        auto context = new InterpreterContext(fun, _gc);
-        _ctx = context;
-        while (_ctx)
-            step();
+        auto context = new InterpreterContext(fun, this);
+        auto returnType = fun.returnType;
+        if (!(returnType is null))
+            context.returnMem = gcallocate(returnType, computeSize(returnType, is32Bit));
+        switchToContext(context);
+        run();
 
         auto result = new InterpreterResult();
+        result.resultType = returnType;
+        result.result = context.returnMem;
 
-        if (!(resultReg is null))
+        if (!(returnType is null))
         {
-            // evaluate result
-            result.resultType = resultReg.type;
-            result.result = context.getValue(resultReg);
-
             writeln("The program quitted with:");
             writeln( prettyPrint( result.resultType, is32Bit, result.result.data, "(return value)" ) );
         }
-
+        
         return result;
     }
 }
