@@ -119,6 +119,15 @@ final class InterpreterContext
         *dst = *src;
     }
 
+    public void loadArray(T)(Register reg, InstructionOperand value)
+    {
+        auto data = *value.peek!(ReadOnlyIndexable!T)();
+        gcallocate(reg, data.count);
+        auto mem = *cast(T**)(getValue(reg).data);
+        foreach (idx, value; data)
+            mem[idx] = value;
+    }
+
     public void blockCopy(RuntimeObject destination, RuntimeObject source, 
                           int destinationOffset, int sourceOffset, int size)
     {
@@ -647,6 +656,46 @@ final class InterpreterContext
                 loadRegister!double(inst.targetRegister, inst.operand);
                 break;
 
+            case OperationCode.loadUI8A:
+                loadArray!ubyte(inst.targetRegister, inst.operand);
+                break;
+
+            case OperationCode.loadI8A:
+                loadArray!byte(inst.targetRegister, inst.operand);
+                break;
+
+            case OperationCode.loadUI16A:
+                loadArray!ushort(inst.targetRegister, inst.operand);
+                break;
+
+            case OperationCode.loadI16A:
+                loadArray!short(inst.targetRegister, inst.operand);
+                break;
+
+            case OperationCode.loadUI32A:
+                loadArray!uint(inst.targetRegister, inst.operand);
+                break;
+
+            case OperationCode.loadI32A:
+                loadArray!int(inst.targetRegister, inst.operand);
+                break;
+
+            case OperationCode.loadUI64A:
+                loadArray!ulong(inst.targetRegister, inst.operand);
+                break;
+
+            case OperationCode.loadI64A:
+                loadArray!long(inst.targetRegister, inst.operand);
+                break;
+
+            case OperationCode.loadF32A:
+                loadArray!float(inst.targetRegister, inst.operand);
+                break;
+
+            case OperationCode.loadF64A:
+                loadArray!double(inst.targetRegister, inst.operand);
+                break;
+
             case OperationCode.loadFunc:
                 // this assumes that a Function (ref) fits into a function pointer
                 loadRegister!Function(inst.targetRegister, inst.operand);
@@ -661,6 +710,16 @@ final class InterpreterContext
             case OperationCode.loadSize:
                 auto size = computeSize(*inst.operand.peek!Type(), is32Bit);
                 *cast(size_t*)getValue(inst.targetRegister).data = size;
+                break;
+
+            //case OperationCode.loadAlign:
+            //    auto alignment = computeAlignment(*inst.operand.peek!Type(), is32Bit);
+            //    *cast(size_t*)getValue(inst.targetRegister).data = alignment;
+            //    break;
+
+            case OperationCode.loadOffset:
+                auto offset = computeOffset(*inst.operand.peek!Field(), is32Bit);
+                *cast(size_t*)getValue(inst.targetRegister).data = offset;
                 break;
 
 
@@ -847,10 +906,7 @@ final class InterpreterContext
                     // handle conversion from ptr to array
 
 
-                    // Type 3 convert
-                    // T* -> U* for any T and any U.
-
-                    // Type 4 & 5 convert
+                    // Type 5 & 6 convert
                     // T* -> T[] for any T.
                     // T[] -> T* for any T.
                     if ((isType!(PointerType)(inst.sourceRegister1.type) && isType!(ArrayType)(inst.targetRegister.type)) || 
@@ -863,10 +919,14 @@ final class InterpreterContext
                         break;
                     }
 
-
-
-                    // Type 6 convert
+                    // Type 7 convert (TODO)
                     // T[E] -> U[E] for any valid T -> U conversion.
+
+                    // Type 8 convert (TODO)
+                    // R1(T1, ...) -> R2(U1, ...) for any R1, any R2, and any amount and type of T n and U m.
+
+                    // Type 10 convert (TODO)
+                    // T* -> R(U1, ...) for any T, any R, and any amount and type of Un.
 
 
                     // Direct conversions
@@ -877,7 +937,13 @@ final class InterpreterContext
                     // Type 2 convert
                     // T* -> uint or int for any T.
 
-                    // Type 7 convert
+                    // Type 3 convert
+                    // uint or int -> T* for any T.
+
+                    // Type 4 convert
+                    // T* -> U* for any T and any U.
+
+                    // Type 9 convert
                     // R(T1, ...) -> U* for any R, any amount and type of Tn, and any U.
                     binaryDispatcher!"doConv"(inst.targetRegister, inst.sourceRegister1);
                 }
