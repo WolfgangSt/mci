@@ -500,7 +500,7 @@ final class InterpreterContext
         auto callCtx = returnContext;
 
         ubyte *dst = null;
-        if (!(intrinsic.returnType is null))
+        if (intrinsic.returnType)
             dst = callCtx.getValue(inst.targetRegister).data;
 
         auto fptr = intrinsicFunctions[intrinsic];
@@ -527,7 +527,7 @@ final class InterpreterContext
         auto callCtx = returnContext;
 
         ubyte *dst = null;
-        if (!(fun.returnType is null))
+        if (fun.returnType)
         {
             auto callInst = callCtx.block.instructions[callCtx.instructionIndex - 1];
             dst = callCtx.getValue(callInst.targetRegister).data;
@@ -921,7 +921,7 @@ final class InterpreterContext
                 break;
 
             case OperationCode.conv:
-                if (inst.targetRegister == inst.sourceRegister1)
+                if (inst.targetRegister is inst.sourceRegister1)
                 {
                     // debug instruction
                     auto arg = inst.sourceRegister1;
@@ -1184,8 +1184,7 @@ private FFIType* toFFIType(Type t)
     {
         synchronized(ffiStructTypeCache)
         {
-            auto cache = ffiStructTypeCache.get(t);
-            if (!(cache is null))
+            if (auto cache = ffiStructTypeCache.get(t))
                 return *cache;
 
             // build a new ffi type
@@ -1249,7 +1248,7 @@ private void step()
 
 private void run()
 {
-    while (!(currentContext is null) && currentContext.ready)
+    while (currentContext && currentContext.ready)
         currentContext.step();
 }
 
@@ -1293,8 +1292,7 @@ public final class Interpreter
 
     private FFIClosure getClosure(Function function_)
     {
-        auto cache = _closureCache.get(function_);
-        if (!(cache is null))
+        if (auto cache = _closureCache.get(function_))
             return *cache;
 
         // need a trampoline
@@ -1333,7 +1331,7 @@ public final class Interpreter
             // if data is to be returned, allocate mem
             auto returnType = function_.returnType;
             uint returnSize = 0;
-            if (!(returnType is null))
+            if (returnType)
             {
                 returnSize = computeSize(returnType, is32Bit);
                 context.returnMem = gcallocate(returnType, returnSize);
@@ -1347,7 +1345,7 @@ public final class Interpreter
             foreach (arg; context.args)
                 gcfree(arg);
 
-            if (!(returnType is null))
+            if (returnType)
             {
                 memcpy(ret, context.returnMem.data, returnSize);
                 gcfree(context.returnMem);
@@ -1453,7 +1451,7 @@ public final class Interpreter
     {
         auto context = new InterpreterContext(fun, this);
         auto returnType = fun.returnType;
-        if (!(returnType is null))
+        if (returnType)
             context.returnMem = gcallocate(returnType, computeSize(returnType, is32Bit));
         switchToContext(context);
         run();
@@ -1462,7 +1460,7 @@ public final class Interpreter
         result.resultType = returnType;
         result.result = context.returnMem;
 
-        if (!(returnType is null))
+        if (returnType)
         {
             writeln("The program quitted with:");
             writeln( prettyPrint( result.resultType, is32Bit, result.result.data, "(return value)" ) );
