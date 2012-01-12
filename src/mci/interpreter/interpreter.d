@@ -1,6 +1,7 @@
 module mci.interpreter.interpreter;
 
 import core.stdc.string,
+       core.thread,
        ffi,
        mci.core.code.modules,
        mci.core.common,
@@ -23,6 +24,9 @@ import core.stdc.string,
        std.string,
        std.traits,
        std.utf;
+
+extern (C) void* memcpy(void*, const void*, size_t);
+extern (C) void rt_moduleTlsCtor();
 
 static if (operatingSystem == OperatingSystem.windows)
 {
@@ -722,6 +726,20 @@ final class InterpreterContext
                 *cast(size_t*)getValue(inst.targetRegister).data = offset;
                 break;
 
+            case OperationCode.fieldGet:
+                auto dest = getValue(inst.targetRegister).data;
+                auto source = getValue(inst.sourceRegister1).data;
+                auto field = *inst.operand.peek!Field();
+                auto offset = computeOffset(field, is32Bit);
+                auto size = computeSize(field.type, is32Bit); 
+
+                if (isType!PointerType(inst.sourceRegister1.type))
+                    source = *cast(ubyte**)source;
+
+                source += offset;
+                memcpy(dest, source, size);
+
+                break;
 
             case OperationCode.fieldSet:
                 auto dest = getValue(inst.sourceRegister1).data;
@@ -734,21 +752,6 @@ final class InterpreterContext
                     dest = *cast(ubyte**)dest;
 
                 dest += offset;
-                memcpy(dest, source, size);
-
-                break;
-
-            case OperationCode.fieldGet:
-                auto dest = getValue(inst.targetRegister).data;
-                auto source = getValue(inst.sourceRegister1).data;
-                auto field = *inst.operand.peek!Field();
-                auto offset = computeOffset(field, is32Bit);
-                auto size = computeSize(field.type, is32Bit); 
-
-                if (isType!PointerType(inst.sourceRegister1.type))
-                    source = *cast(ubyte**)source;
-
-                source += offset;
                 memcpy(dest, source, size);
 
                 break;
@@ -766,6 +769,30 @@ final class InterpreterContext
                 source += offset;
                 *cast(ubyte**)dest = source;
 
+                break;
+
+            case OperationCode.fieldGGet:
+                auto field = *inst.operand.peek!Field();
+                auto dest = getValue(inst.targetRegister).data;
+                auto source = getGlobal(field);
+                auto size = computeSize(field.type, is32Bit); 
+                memcpy(dest, source, size);
+                break;
+
+            case OperationCode.fieldGSet:
+                auto field = *inst.operand.peek!Field();
+                auto source = getValue(inst.sourceRegister1).data;
+                auto dest = getGlobal(field);
+                auto size = computeSize(field.type, is32Bit); 
+                memcpy(dest, source, size);
+                break;
+
+            case OperationCode.fieldGAddr:
+                auto field = *inst.operand.peek!Field();
+                auto dest = getValue(inst.targetRegister).data;
+                auto source = getGlobal(field);
+                auto size = computeSize(field.type, is32Bit); 
+                *cast(ubyte**)dest = source;
                 break;
 
 
@@ -1082,10 +1109,26 @@ final class InterpreterContext
 // shared data
 
 private __gshared Dictionary!(Type, FFIType*) ffiStructTypeCache;
+private __gshared Dictionary!(Field, ubyte*) globals;
+private Dictionary!(Field, ubyte*) tlsGlobals;
+
 
 shared static this() 
 {
     ffiStructTypeCache = new Dictionary!(Type, FFIType*);
+    globals = new Dictionary!(Field, ubyte*);
+}
+
+static this()
+{
+    
+    writefln(">> TLS dict startup on %s <<", cast(ubyte*)Thread.getThis());
+    tlsGlobals = new Dictionary!(Field, ubyte*);
+}
+
+static ~this()
+{
+    writefln(">> TLS dict teardown on %s <<", cast(ubyte*)Thread.getThis());
 }
 
 private FFIType* toFFIType(Type t)
@@ -1175,6 +1218,24 @@ private FFIInterface toFFIConvention(CallingConvention cc)
     }
 }
 
+ubyte* getGlobal(Field f)
+{
+    if (f.storage == FieldStorage.thread)
+    {
+        if (auto cache = tlsGlobals.get(f))
+            return *cache;
+
+        return tlsGlobals[f] = cast(ubyte*)calloc(1, computeSize(f.type, is32Bit));
+    } 
+    else synchronized(globals)
+    {
+        if (auto cache = globals.get(f))
+            return *cache;
+
+        return globals[f] = cast(ubyte*)calloc(1, computeSize(f.type, is32Bit));
+    }
+}
+
 
 ////////////////////////////////////////////////////////////////////////////////
 // per thread data
@@ -1248,8 +1309,15 @@ public final class Interpreter
         // careful trampolines actually consume stack
         auto trampoline = delegate void(void* ret, void** args) 
         { 
-            writefln("Trampoline fired!");
+            if (!tlsGlobals)
+            {
+                writefln(">> Registering thread to druntime <<");
+                thread_attachThis();
+                rt_moduleTlsCtor();
+                auto thread = Thread.getThis();
 
+                writefln(">> ok, Thread.getThis() = %s <<", cast(ubyte*)thread);
+            }
           
             // marshall data
             auto context = new InterpreterContext(function_, this);
