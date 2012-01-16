@@ -73,6 +73,18 @@ final class InterpreterContext
         gotoBlock("entry");
     }
 
+    private void allocateVectorMem(Register reg)
+    {
+        if (auto vec = cast(VectorType)reg.type)
+        {
+            // allocate vector data as well
+            auto mem = getValue(reg);
+            auto vecsize = computeSize(vec.elementType, is32Bit) * vec.elements;
+            //writefln("  Allocating %s additional bytes for data", vecsize);
+            *cast(ubyte**)mem.data = (new ubyte[vecsize]).ptr;
+        }
+    }
+
     public this (Function f, Interpreter interpreter, bool jumpToEntry = true)
     {
         _interpreter = interpreter;
@@ -88,13 +100,7 @@ final class InterpreterContext
             auto mem = _interpreter.gcallocate(reg.type, size);
             _registerState.add(reg, mem);
 
-            if (auto vec = cast(VectorType)reg.type)
-            {
-                // allocate vector data as well
-                auto vecsize = computeSize(vec.elementType, is32Bit) * vec.elements;
-                //writefln("  Allocating %s additional bytes for data", vecsize);
-                *cast(ubyte**)mem.data = (new ubyte[vecsize]).ptr;
-            }
+            allocateVectorMem(reg);
         }
 
         if (jumpToEntry)
@@ -1026,15 +1032,19 @@ final class InterpreterContext
 
             case OperationCode.memNew:
                 allocate(inst.targetRegister, 1);
+                allocateVectorMem(inst.targetRegister);
                 break;
 
             case OperationCode.memGCAlloc:
+            case OperationCode.memSAlloc:
                 auto count = *cast(size_t*)getValue(inst.sourceRegister1).data;
                 gcallocate(inst.targetRegister, count);
                 break;
 
             case OperationCode.memGCNew:
+            case OperationCode.memSNew:
                 gcallocate(inst.targetRegister, 1);
+                allocateVectorMem(inst.targetRegister);
                 break;
 
 
@@ -1120,15 +1130,12 @@ shared static this()
 }
 
 static this()
-{
-    
-    writefln(">> TLS dict startup on %s <<", cast(ubyte*)Thread.getThis());
+{    
     tlsGlobals = new Dictionary!(Field, ubyte*);
 }
 
 static ~this()
 {
-    writefln(">> TLS dict teardown on %s <<", cast(ubyte*)Thread.getThis());
 }
 
 private FFIType* toFFIType(Type t)
@@ -1290,6 +1297,53 @@ public final class Interpreter
         }
     }
 
+    private RuntimeObject[] serializeArgs(ReadOnlyIndexable!Parameter params, ubyte** argMem)
+    {
+        auto args = new RuntimeObject[params.count];
+
+        foreach (idx, p; params)
+        {
+            auto size = computeSize(p.type, is32Bit);
+            auto arg = gcallocate(p.type, size);
+            memcpy(arg.data, argMem[idx], size);
+            args[idx] = arg;
+        }
+
+        return args;
+    }
+
+    private void runFunction(Function function_, ubyte *returnMem, ubyte** argMem)
+    {
+        auto context = new InterpreterContext(function_, this);
+
+        context.args = serializeArgs(function_.parameters, argMem);
+
+        // if data is to be returned, allocate mem
+        auto returnType = function_.returnType;
+        uint returnSize = 0;
+        if (returnType)
+        {
+            returnSize = computeSize(returnType, is32Bit);
+            context.returnMem = gcallocate(returnType, returnSize);
+        }
+
+        // run
+        switchToContext(context);
+        run();
+
+        // marshal and free up
+        foreach (arg; context.args)
+            gcfree(arg);
+
+        if (returnType)
+        {
+            memcpy(returnMem, context.returnMem.data, returnSize);
+            gcfree(context.returnMem);
+        }
+
+        context.releaseLocals();
+    }
+
     private FFIClosure getClosure(Function function_)
     {
         if (auto cache = _closureCache.get(function_))
@@ -1309,49 +1363,11 @@ public final class Interpreter
         { 
             if (!tlsGlobals)
             {
-                writefln(">> Registering thread to druntime <<");
                 thread_attachThis();
                 rt_moduleTlsCtor();
-                auto thread = Thread.getThis();
-
-                writefln(">> ok, Thread.getThis() = %s <<", cast(ubyte*)thread);
             }
           
-            // marshall data
-            auto context = new InterpreterContext(function_, this);
-            context.args = new RuntimeObject[params.count];
-            foreach (idx, p; params)
-            {
-                auto size = computeSize(p.type, is32Bit);
-                auto arg = gcallocate(p.type, size);
-                memcpy(arg.data, args[idx], size);
-                context.args[idx] = arg;
-            }
-
-            // if data is to be returned, allocate mem
-            auto returnType = function_.returnType;
-            uint returnSize = 0;
-            if (returnType)
-            {
-                returnSize = computeSize(returnType, is32Bit);
-                context.returnMem = gcallocate(returnType, returnSize);
-            }
-
-            // run
-            switchToContext(context);
-            run();
-
-            // marshall and free up
-            foreach (arg; context.args)
-                gcfree(arg);
-
-            if (returnType)
-            {
-                memcpy(ret, context.returnMem.data, returnSize);
-                gcfree(context.returnMem);
-            }
-
-            context.releaseLocals();
+            runFunction(function_, cast(ubyte*)ret, cast(ubyte**)args);
         };
 
         auto cconv = toFFIConvention(function_.callingConvention);
