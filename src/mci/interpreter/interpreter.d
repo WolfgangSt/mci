@@ -52,7 +52,7 @@ final class InterpreterContext
     public RuntimeObject returnMem;
     public RuntimeObject[] args;
     public int _argIndex;
-    private Dictionary!(Register, RuntimeObject) _registerState;
+    private Dictionary!(Register, RuntimeObject, false) _registerState;
     private int _numPushs;
     private Interpreter _interpreter;
 
@@ -90,7 +90,7 @@ final class InterpreterContext
         _interpreter = interpreter;
         fun = f;
 
-        _registerState = new Dictionary!(Register, RuntimeObject)();
+        _registerState = new Dictionary!(Register, RuntimeObject, false)();
         foreach (namereg; f.registers)
         {
             auto reg = namereg.y;
@@ -449,7 +449,8 @@ final class InterpreterContext
                 rhsMem += size;
             }
 
-        } else  
+        } 
+        else  
             emulateALU2!(op, binary)(lhsType, dstMem, lhsMem, rhsMem);  
     }
 
@@ -479,7 +480,8 @@ final class InterpreterContext
                 rhsMem += size;
             }
 
-        } else  
+        } 
+        else  
             emulateALU2!(op, binary, "size_t")(lhsType, dstMem, lhsMem, rhsMem);  
     }
 
@@ -521,7 +523,7 @@ final class InterpreterContext
     private void doFFI(Instruction inst)
     {
         auto ffisig = *inst.operand.peek!FFISignature();
-        auto fptr = _interpreter.resolveEntrypoint(ffisig);
+        auto fptr = _interpreter.resolveEntryPoint(ffisig);
 
         if (fptr is null)
             throw new InterpreterException("Cannot resolve export " ~ ffisig.entryPoint ~ " in " ~ ffisig.library);
@@ -581,7 +583,7 @@ final class InterpreterContext
             auto elementType = typ.elementType;
             auto elementSize = computeSize(elementType, is32Bit);
             auto mem = _interpreter.gcallocate(elementType, count * elementSize);
-            *dst = mem.data;
+            *dst = mem ? mem.data : null;
 
             return;
         }
@@ -592,7 +594,7 @@ final class InterpreterContext
             auto elementType = typ.elementType;
             auto elementSize = computeSize(elementType, is32Bit);
             auto mem = _interpreter.gcallocate(elementType, count * elementSize);
-            *dst = mem.data;
+            *dst = mem ? mem.data : null;
 
             return;
         }
@@ -780,7 +782,7 @@ final class InterpreterContext
             case OperationCode.fieldGGet:
                 auto field = *inst.operand.peek!Field();
                 auto dest = getValue(inst.targetRegister).data;
-                auto source = getGlobal(field);
+                auto source = _interpreter.getGlobal(field);
                 auto size = computeSize(field.type, is32Bit); 
                 memcpy(dest, source, size);
                 break;
@@ -788,7 +790,7 @@ final class InterpreterContext
             case OperationCode.fieldGSet:
                 auto field = *inst.operand.peek!Field();
                 auto source = getValue(inst.sourceRegister1).data;
-                auto dest = getGlobal(field);
+                auto dest = _interpreter.getGlobal(field);
                 auto size = computeSize(field.type, is32Bit); 
                 memcpy(dest, source, size);
                 break;
@@ -796,7 +798,7 @@ final class InterpreterContext
             case OperationCode.fieldGAddr:
                 auto field = *inst.operand.peek!Field();
                 auto dest = getValue(inst.targetRegister).data;
-                auto source = getGlobal(field);
+                auto source = _interpreter.getGlobal(field);
                 auto size = computeSize(field.type, is32Bit); 
                 *cast(ubyte**)dest = source;
                 break;
@@ -844,7 +846,8 @@ final class InterpreterContext
                     subContext.returnContext = this;
                     subContext.args = collectArgs();
                     switchToContext(subContext);
-                } else
+                } 
+                else
                     throw new InterpreterException("Foreign Function Interfacing not supported yet");
                 break;
 
@@ -932,7 +935,8 @@ final class InterpreterContext
                     // debug instruction
                     auto arg = inst.sourceRegister1;
                     writeln( prettyPrint(arg.type, is32Bit, getValue(arg).data, arg.name ) );
-                } else
+                } 
+                else
                 {
                     // TODO: 
                     // handle conversion from array to ptr
@@ -1069,7 +1073,10 @@ final class InterpreterContext
                 break;
 
             case OperationCode.memGCFree:
-                auto mem = *cast(ubyte**)getValue(inst.sourceRegister1).data;
+                auto rtoDataPointer = getValue(inst.sourceRegister1).data;
+                if (!rtoDataPointer)
+                    break;
+                auto mem = *cast(ubyte**)rtoDataPointer;
                 auto rto = RuntimeObject.fromData(mem);
                 _interpreter.gcfree(rto);
                 break;
@@ -1118,20 +1125,18 @@ final class InterpreterContext
 ////////////////////////////////////////////////////////////////////////////////
 // shared data
 
-private __gshared Dictionary!(Type, FFIType*) ffiStructTypeCache;
-private __gshared Dictionary!(Field, ubyte*) globals;
-private Dictionary!(Field, ubyte*) tlsGlobals;
+private __gshared Dictionary!(Type, FFIType*, false) ffiStructTypeCache;
+private Dictionary!(Tuple!(Interpreter, Field), ubyte*, false) tlsGlobals;
 
 
 shared static this() 
 {
-    ffiStructTypeCache = new Dictionary!(Type, FFIType*);
-    globals = new Dictionary!(Field, ubyte*);
+    ffiStructTypeCache = new Dictionary!(Type, FFIType*, false);
 }
 
 static this()
 {    
-    tlsGlobals = new Dictionary!(Field, ubyte*);
+    tlsGlobals = new Dictionary!(Tuple!(Interpreter, Field), ubyte*, false);
 }
 
 static ~this()
@@ -1224,24 +1229,6 @@ private FFIInterface toFFIConvention(CallingConvention cc)
     }
 }
 
-ubyte* getGlobal(Field f)
-{
-    if (f.storage == FieldStorage.thread)
-    {
-        if (auto cache = tlsGlobals.get(f))
-            return *cache;
-
-        return tlsGlobals[f] = cast(ubyte*)calloc(1, computeSize(f.type, is32Bit));
-    } 
-    else synchronized(globals)
-    {
-        if (auto cache = globals.get(f))
-            return *cache;
-
-        return globals[f] = cast(ubyte*)calloc(1, computeSize(f.type, is32Bit));
-    }
-}
-
 
 ////////////////////////////////////////////////////////////////////////////////
 // per thread data
@@ -1271,13 +1258,15 @@ private void switchToContext(InterpreterContext context)
 public final class Interpreter
 {
     private GarbageCollector _gc;
-    private Dictionary!(Function, FFIClosure) _closureCache;
+    private Dictionary!(Function, FFIClosure, false) _closureCache;
+    private Dictionary!(Field, ubyte*, false) _globals;
     
 
     public this(GarbageCollector collector)
     {
         _gc = collector;
-        _closureCache = new Dictionary!(Function, FFIClosure);
+        _closureCache = new Dictionary!(Function, FFIClosure, false);
+        _globals = new Dictionary!(Field, ubyte*, false);
     }
 
     public InterpreterResult interpret(Module mod)
@@ -1296,6 +1285,26 @@ public final class Interpreter
             return runFunction(main);
         }
     }
+
+    ubyte* getGlobal(Field f)
+    {
+        if (f.storage == FieldStorage.thread)
+        {
+            auto key = tuple(this, f);
+            if (auto cache = tlsGlobals.get(key))
+                return *cache;
+
+            return tlsGlobals[key] = cast(ubyte*)calloc(1, computeSize(f.type, is32Bit));
+        } 
+        else synchronized(_globals)
+        {
+            if (auto cache = _globals.get(f))
+                return *cache;
+
+            return _globals[f] = cast(ubyte*)calloc(1, computeSize(f.type, is32Bit));
+        }
+    }
+
 
     private RuntimeObject[] serializeArgs(ReadOnlyIndexable!Parameter params, ubyte** argMem)
     {
@@ -1358,7 +1367,11 @@ public final class Interpreter
             argTypes[idx] = toFFIType(p.type);
 
 
-        // careful trampolines actually consume stack
+        // careful, as trampoline invocations from native code consume stack until emulation returns.
+        // In case a ffi happens during this emulation with noreturn semantics but rather invoking
+        // (semantically a jump instruction within the native code) to another trampoline we will
+        // leak this D stackframe.
+        // But there is not much we can do about this for the moment.
         auto trampoline = delegate void(void* ret, void** args) 
         { 
             if (!tlsGlobals)
@@ -1366,6 +1379,7 @@ public final class Interpreter
                 thread_attachThis();
                 rt_moduleTlsCtor();
             }
+            _gc.attach();
           
             runFunction(function_, cast(ubyte*)ret, cast(ubyte**)args);
         };
@@ -1388,7 +1402,7 @@ public final class Interpreter
         _gc.free(r);
     }
 
-    public FFIFunction resolveEntrypoint(FFISignature sig)
+    public FFIFunction resolveEntryPoint(FFISignature sig)
     {
         static if (operatingSystem == OperatingSystem.windows)
         {
@@ -1420,11 +1434,12 @@ public final class Interpreter
         auto fun = cast(Function)(*cast(ubyte**)mem);
 
         // TODO:
-        // unfortunatley D wont validate the above cast, so we have to do this ourself here
-        // by walking over all currently loaded functions.
-        // at the moment we assume it always is a Function
+        // Unfortunatley D wont validate the above cast. 
+        // We have to do this by ourself here by walking over all currently loaded functions.
+        // At the moment we just assume it always is a Function.
+        // This wont allow code passing native funcpointers around for the moment.
         //
-        // use the XRefVisitor to collect all funcs during startup and check fun against them
+        // Solution: use the XRefVisitor to collect all funcs during startup and check fun against them
         
         return fun;
     }
@@ -1434,9 +1449,8 @@ public final class Interpreter
     {
         if (auto fptr = cast(FunctionPointerType)t)
         {
-            // the supplied argument is either a native function pointer to a function
-            // or a pointer to a Function object in the latter case we need to
-            // create a trampoline to the emulator
+            // The supplied argument is either a native function pointer or a pointer to a Function object. 
+            // In the latter case we need to create a trampoline to the emulator
 
             if (auto fun = toFunction(mem))
                 return cast(ubyte*)getClosure(fun).function_;
