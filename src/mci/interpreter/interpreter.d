@@ -14,6 +14,7 @@ import core.stdc.string,
        mci.core.typing.members,
        mci.core.typing.types,
        mci.core.code.opcodes,
+       mci.interpreter.allocator,
        mci.interpreter.exception,
        mci.core.code.instructions,
        mci.vm.intrinsics.declarations,
@@ -88,6 +89,15 @@ final class InterpreterContext
         gotoBlock("entry");
     }
 
+    public void releaseLocals()
+    {
+        foreach (r; _registerState)
+        {
+            auto typ = r.x.type;
+            _interpreter._stackAlloc.free(typ);
+        }
+    }
+
     public this (Function f, Interpreter interpreter, bool jumpToEntry = true)
     {
         _interpreter = interpreter;
@@ -97,9 +107,7 @@ final class InterpreterContext
         foreach (namereg; f.registers)
         {
             auto reg = namereg.y;
-
-            auto size = computeSize(reg.type, is32Bit);
-            auto mem = cast(ubyte*)_calloc(1, size);
+            auto mem = _interpreter._stackAlloc.allocate(reg.type);
             _registerState.add(reg, mem);
         }
 
@@ -107,6 +115,7 @@ final class InterpreterContext
             gotoEntry();
     }
 
+    // dereferences an array or vector element
     public ubyte* arrayElement(Register arrayReg, Register indexReg, out uint size)
     {
         auto arrayRto = *cast(RuntimeObject*)getValue(arrayReg);
@@ -126,6 +135,23 @@ final class InterpreterContext
         return array + index * size;
     }
 
+    // (de)references a struct field given a struct pointer or ref
+    public ubyte* structElement(Register structReg, Field field, out uint size)
+    {
+        auto mem = getValue(structReg);
+        auto offset = computeOffset(field, is32Bit);
+        auto typ = structReg.type;
+
+        size = computeSize(field.type, is32Bit); 
+
+        if (isType!PointerType(typ))
+            mem = *cast(ubyte**)mem;
+        else if (isType!ReferenceType(typ))
+            mem = (*cast(RuntimeObject*)mem).data;
+
+        return mem + offset;
+    }
+
     public void loadRegister(T)(Register reg, InstructionOperand value)
     {
         auto src = value.peek!T();
@@ -143,7 +169,7 @@ final class InterpreterContext
             dst = *cast(ubyte**)(dst);
         else 
         {
-            dst = (cast(RuntimeObject)dst).data;
+            dst = (*cast(RuntimeObject*)dst).data;
             if (isType!ArrayType(reg.type))
                 dst += computeSize(NativeUIntType.instance, is32Bit);
         }
@@ -163,12 +189,6 @@ final class InterpreterContext
     {
         auto size = computeSize(target.type, is32Bit);
         memcpy(_registerState[target], args[_argIndex++], size);
-    }
-
-    public void releaseLocals()
-    {
-        foreach (r; _registerState.values())
-            _free(r);
     }
 
     struct NullType {};
@@ -439,6 +459,14 @@ final class InterpreterContext
 
     private void allocate(Register target, size_t count)
     {
+        if (auto typ = (cast(ReferenceType)target.type))
+        {
+            auto dst = cast(ubyte**)getValue(target);
+            auto mem = _interpreter.gcallocate(typ, 0);
+            *dst = cast(ubyte*)mem;
+            return;
+        }
+
         if (auto typ = (cast(PointerType)target.type))
         {
             auto dst = cast(ubyte**)getValue(target);
@@ -478,18 +506,20 @@ final class InterpreterContext
 
     private void convert(Type srcType, Type dstType, ubyte* srcMem, ubyte* dstMem)
     {
-        // Type 7 convert
+        // Type 5 convert
         // T[E] -> U[E] for any valid T -> U conversion.
         if (auto srcVec = cast(VectorType)(srcType))
         {
-            throw new InterpreterException("Not implemented, yet"); // need to allocate the target vec
             auto dstVec = cast(VectorType)(dstType);
 
-            srcMem = *cast(ubyte**)srcMem;
-            dstMem = *cast(ubyte**)dstMem;
+            auto srcRto = *cast(RuntimeObject*)srcMem;
+            auto dstRto = *cast(RuntimeObject*)dstMem;
 
             auto dstSize = computeSize(dstVec.elementType, is32Bit);
             auto srcSize = computeSize(srcVec.elementType, is32Bit);
+
+            srcMem = srcRto.data;
+            dstMem = dstRto.data;
 
             for (auto i = 0; i < srcVec.elements; i++)
             {
@@ -501,28 +531,28 @@ final class InterpreterContext
             return;
         }
 
-        // Type 8 convert (Direct conversion as pointer type)
-        // R1(T1, ...) -> R2(U1, ...) for any R1, any R2, and any amount and type of T n and U m.
-
-        // Type 10 convert (Direct conversion as pointer type)
-        // T* -> R(U1, ...) for any T, any R, and any amount and type of Un.
-
         // Direct conversions
 
         // Type 1 convert
         // T -> U for any primitives T and U (int8, uint8, int16, uint16, int32, uint32, int64, uint64, int, uint, float32, and float64).
 
         // Type 2 convert
-        // T* -> uint or int for any T.
-
-        // Type 3 convert
-        // uint or int -> T* for any T.
-
-        // Type 4 convert
         // T* -> U* for any T and any U.
 
-        // Type 9 convert (Direct conversion as pointer type)
+        // Type 3 convert
+        // T* -> uint or int for any T.
+
+        // Type 4 convert
+        // uint or int -> T* for any T.
+
+        // Type 6 convert (Direct conversion as pointer type)
+        // R1(T1, ...) -> R2(U1, ...) for any R1, any R2, and any amount and type of T n and U m.
+
+        // Type 7 convert (Direct conversion as pointer type)
         // R(T1, ...) -> U* for any R, any amount and type of Tn, and any U.
+
+        // Type 8 convert (Direct conversion as pointer type)
+        // T* -> R(U1, ...) for any T, any R, and any amount and type of Un.
         binaryDispatcher2!("doConv")(srcType, dstType, srcMem, dstMem);
     }
 
@@ -659,46 +689,26 @@ final class InterpreterContext
                 break;
 
             case OperationCode.fieldGet:
+                uint size;
+                auto source = structElement(inst.sourceRegister1, *inst.operand.peek!Field(), size);
                 auto dest = getValue(inst.targetRegister);
-                auto source = getValue(inst.sourceRegister1);
-                auto field = *inst.operand.peek!Field();
-                auto offset = computeOffset(field, is32Bit);
-                auto size = computeSize(field.type, is32Bit); 
-
-                if (isType!PointerType(inst.sourceRegister1.type))
-                    source = *cast(ubyte**)source;
-
-                source += offset;
                 memcpy(dest, source, size);
 
                 break;
 
             case OperationCode.fieldSet:
-                auto dest = getValue(inst.sourceRegister1);
+                uint size;
+                auto dest = structElement(inst.sourceRegister1, *inst.operand.peek!Field(), size);
                 auto source = getValue(inst.sourceRegister2);
-                auto field = *inst.operand.peek!Field();
-                auto offset = computeOffset(field, is32Bit);
-                auto size = computeSize(field.type, is32Bit);
-
-                if (isType!PointerType(inst.sourceRegister1.type))
-                    dest = *cast(ubyte**)dest;
-
-                dest += offset;
                 memcpy(dest, source, size);
 
                 break;
 
             case OperationCode.fieldAddr:
+                uint size;
+                auto source = structElement(inst.sourceRegister1, *inst.operand.peek!Field(), size);
                 auto dest = getValue(inst.targetRegister);
-                auto source = getValue(inst.sourceRegister1);
-                auto field = *inst.operand.peek!Field();
-                auto offset = computeOffset(field, is32Bit);
-                auto size = computeSize(field.type, is32Bit); 
 
-                if (isType!PointerType(inst.sourceRegister1.type))
-                    source = *cast(ubyte**)source;
-
-                source += offset;
                 *cast(ubyte**)dest = source;
 
                 break;
@@ -1167,6 +1177,7 @@ public final class Interpreter
     private GarbageCollector _gc;
     private Dictionary!(Function, FFIClosure, false) _closureCache;
     private Dictionary!(Field, ubyte*, false) _globals;
+    private DualStackAllocator _stackAlloc;
     
 
     public this(GarbageCollector collector)
@@ -1174,6 +1185,7 @@ public final class Interpreter
         _gc = collector;
         _closureCache = new Dictionary!(Function, FFIClosure, false);
         _globals = new Dictionary!(Field, ubyte*, false);
+        _stackAlloc = new DualStackAllocator(_gc);
     }
 
     public InterpreterResult interpret(Module mod)

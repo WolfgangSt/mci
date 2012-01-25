@@ -193,6 +193,7 @@
   <filesToClean>*.obj;*.cmd;*.build;*.json;*.dep</filesToClean>
  </Config>
  <Folder name="mci.interpreter">
+  <File path="allocator.d" />
   <File path="exception.d" />
   <File path="interpreter.d" />
  </Folder>
