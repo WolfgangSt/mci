@@ -37,15 +37,12 @@ private final class StackAllocatorBlock
         _size = size;
         _mem = cast(ubyte*)calloc(size, 1);
         
-
-        if (_allocator._gc)
-            _allocator._gc.addRoot(_mem);
+        _allocator._gc.addRoot(_mem);
     }
 
     private void releaseBlock()
     {
-        if (_allocator._gc)
-            _allocator._gc.removeRoot(_mem);
+        _allocator._gc.removeRoot(_mem);
         .free(_mem);
         _size = 0;
         _load = 0;
@@ -95,6 +92,11 @@ public final class StackAllocator
     private GarbageCollector _gc;
 
     public this(GarbageCollector gc)
+    in
+    {
+        assert(gc);
+    }
+    body
     {
         _gc = gc;
         _defaultAllocationSize = 0x10000;
@@ -123,31 +125,3 @@ public final class StackAllocator
     }
 }
 
-
-public final class DualStackAllocator
-{
-    private StackAllocator _rtoAlloc;
-    private StackAllocator _rawAlloc;
-
-    public this(GarbageCollector gc)
-    {
-        _rtoAlloc = new StackAllocator(gc);
-        _rawAlloc = new StackAllocator(null);
-    }
-
-    public ubyte* allocate(Type t)
-    {
-        auto size = computeSize(t, is32Bit);
-        if (isRuntimeObject(t))
-            return _rtoAlloc.allocate(size);
-        return _rawAlloc.allocate(size);
-    }
-
-    public void free(Type t)
-    {
-        auto size = computeSize(t, is32Bit);
-        if (isRuntimeObject(t))
-            return _rtoAlloc.free(size);
-        return _rawAlloc.free(size);
-    }
-}
