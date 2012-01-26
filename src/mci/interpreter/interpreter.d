@@ -1177,7 +1177,7 @@ public final class Interpreter
     private GarbageCollector _gc;
     private Dictionary!(Function, FFIClosure, false) _closureCache;
     private Dictionary!(Field, ubyte*, false) _globals;
-    private DualStackAllocator _stackAlloc;
+    private StackAllocator _stackAlloc;
     
 
     public this(GarbageCollector collector)
@@ -1185,7 +1185,7 @@ public final class Interpreter
         _gc = collector;
         _closureCache = new Dictionary!(Function, FFIClosure, false);
         _globals = new Dictionary!(Field, ubyte*, false);
-        _stackAlloc = new DualStackAllocator(_gc);
+        _stackAlloc = new StackAllocator(_gc);
     }
 
     public InterpreterResult interpret(Module mod)

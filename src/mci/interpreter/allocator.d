@@ -111,6 +111,16 @@ public final class StackAllocator
     {
         _topBlock.free(size);
     }
+
+    public ubyte* allocate(Type t)
+    {
+        return allocate(computeSize(t, is32Bit));
+    }
+
+    public void free(Type t)
+    {
+        free(computeSize(t, is32Bit));
+    }
 }
 
 
