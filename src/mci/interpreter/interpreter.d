@@ -842,18 +842,12 @@ final class InterpreterContext
                 break;
 
             case OperationCode.return_:
-                auto src = getValue(inst.sourceRegister1);
-
-                //auto callInst = returnContext.block.instructions[returnContext.instructionIndex - 1];
-                //auto dst = returnContext.getValue(callInst.targetRegister);
-                //auto size = computeSize(callInst.targetRegister.type, is32Bit);
-                
+                auto src = getValue(inst.sourceRegister1);                
                 auto size = computeSize(inst.sourceRegister1.type, is32Bit);
                 memcpy(returnMem, src, size);
 
                 releaseLocals();
                 switchToContext(returnContext);
-
                 break;
 
             case OperationCode.leave:
@@ -941,23 +935,16 @@ final class InterpreterContext
                 allocate(inst.targetRegister, 1);
                 break;
 
-                /*
-            case OperationCode.memGCAlloc:
-            case OperationCode.memSAlloc:
-                auto count = *cast(size_t*)getValue(inst.sourceRegister1);
-                gcallocate(inst.targetRegister, count);
-                break;
-
-            case OperationCode.memGCNew:
-            case OperationCode.memSNew:
-                gcallocate(inst.targetRegister, 1);
-                break;
-                */
-
             case OperationCode.memPin:
-            case OperationCode.memUnpin:
-                break; // currently the interpreter keeps mem pinned during whole lifetime
+                auto rto = *cast(RuntimeObject*)getValue(inst.sourceRegister1);
+                auto handle = _interpreter._gc.pin(rto);
+                *cast(size_t*)getValue(inst.targetRegister) = handle;
+                break;
 
+            case OperationCode.memUnpin:
+                auto handle = *cast(size_t*)getValue(inst.sourceRegister1);
+                _interpreter._gc.unpin(handle);
+                break;
 
             case OperationCode.memSet:
                 auto size = computeSize(inst.sourceRegister2.type, is32Bit);
@@ -978,17 +965,6 @@ final class InterpreterContext
                 auto mem = *cast(ubyte**)getValue(inst.sourceRegister1);
                 _free(mem);
                 break;
-
-                /*
-            case OperationCode.memGCFree:
-                auto rtoDataPointer = getValue(inst.sourceRegister1);
-                if (!rtoDataPointer)
-                    break;
-                auto mem = *cast(ubyte**)rtoDataPointer;
-                auto rto = RuntimeObject.fromData(mem);
-                _interpreter.gcfree(rto);
-                break;
-                */
 
             case OperationCode.memAddr:
                 auto mem = getValue(inst.sourceRegister1);
@@ -1232,7 +1208,7 @@ public final class Interpreter
         foreach (idx, p; params)
         {
             auto size = computeSize(p.type, is32Bit);
-            auto arg = cast(ubyte*)_calloc(1, size);
+            auto arg = _stackAlloc.allocate(size);
             memcpy(arg, argMem[idx], size);
             args[idx] = arg;
         }
@@ -1240,35 +1216,20 @@ public final class Interpreter
         return args;
     }
 
-    // TODO: use returnMem directly once everything works again
     private void runFunction(Function function_, ubyte *returnMem, ubyte** argMem)
     {
         auto context = new InterpreterContext(function_, this);
 
         context.args = serializeArgs(function_.parameters, argMem);
-
-        // if data is to be returned, allocate mem
-        auto returnType = function_.returnType;
-        uint returnSize = 0;
-        if (returnType)
-        {
-            returnSize = computeSize(returnType, is32Bit);
-            context.returnMem = cast(ubyte*)_calloc(1, returnSize);
-        }
+        context.returnMem = returnMem;
 
         // run
         switchToContext(context);
         run();
 
         // marshal and free up
-        foreach (arg; context.args)
-            _free(arg);
-
-        if (returnType)
-        {
-            memcpy(returnMem, context.returnMem, returnSize);
-            _free(context.returnMem);
-        }
+        foreach (param; function_.parameters)
+            _stackAlloc.free(param.type);
     }
 
     private void cleanupThread()
@@ -1312,7 +1273,6 @@ public final class Interpreter
             _gc.attach();
           
             runFunction(function_, cast(ubyte*)ret, cast(ubyte**)args);
-            writefln("Trampoline returning to native code");
         };
 
         auto cconv = toFFIConvention(function_.callingConvention);
@@ -1327,7 +1287,6 @@ public final class Interpreter
     {
         auto typeInfo = getTypeInfo(t, is32Bit);
         auto r = _gc.allocate(typeInfo, additionalSize);
-        _gc.pin(r);
         return r;
     }
 

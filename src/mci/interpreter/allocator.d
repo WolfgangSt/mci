@@ -4,6 +4,7 @@ import mci.core.analysis.utilities,
        mci.core.common,
        mci.core.config,
        mci.core.container,
+       mci.core.typing.core,
        mci.core.typing.types,
        mci.vm.memory.base,
        mci.vm.memory.layout,
@@ -13,15 +14,16 @@ import mci.core.analysis.utilities,
 private final class StackAllocatorBlock
 {
     private size_t _size;
+    private size_t _wordSize;
     private size_t _load;
     private ubyte *_mem;
     private StackAllocatorBlock _predecessor;
     private StackAllocator _allocator;
 
-    public this (size_t size, StackAllocator allocator)
+    public this (size_t sizeInWords, StackAllocator allocator)
     in
     {
-        assert(size);
+        assert(sizeInWords);
         assert(allocator);
     }
     out
@@ -34,15 +36,16 @@ private final class StackAllocatorBlock
         _predecessor = _allocator._topBlock;
         _allocator._topBlock = this;
 
-        _size = size;
-        _mem = cast(ubyte*)calloc(size, 1);
+        _wordSize = computeSize(NativeUIntType.instance, is32Bit);
+        _size = sizeInWords * _wordSize;
+        _mem = cast(ubyte*)calloc(_size, 1);
         
-        _allocator._gc.addRoot(_mem);
+        _allocator._gc.addRange(_mem, sizeInWords);
     }
 
     private void releaseBlock()
     {
-        _allocator._gc.removeRoot(_mem);
+        _allocator._gc.removeRange(_mem);
         .free(_mem);
         _size = 0;
         _load = 0;
@@ -54,9 +57,10 @@ private final class StackAllocatorBlock
         auto newLoad = _load + size;
         if (newLoad > _size)
         {
-            auto newSize = _allocator._defaultAllocationSize;
-            newSize = newSize > size ? newSize : size;
-            auto newBlock = new StackAllocatorBlock(newSize, _allocator);
+            auto newSizeInWords = _allocator._defaultAllocationSize;
+            auto requestedWords = (size + _wordSize - 1) / _wordSize;
+            newSizeInWords = newSizeInWords > requestedWords ? newSizeInWords : requestedWords;
+            auto newBlock = new StackAllocatorBlock(newSizeInWords, _allocator);
 
             return newBlock.allocate(size);
         }
@@ -99,7 +103,7 @@ public final class StackAllocator
     body
     {
         _gc = gc;
-        _defaultAllocationSize = 0x10000;
+        _defaultAllocationSize = 0x10000; // in machine words
     }
 
     public ubyte* allocate(size_t size)
