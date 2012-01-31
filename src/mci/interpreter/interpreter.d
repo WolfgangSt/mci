@@ -1,6 +1,7 @@
 module mci.interpreter.interpreter;
 
 import core.stdc.string,
+       core.memory,
        core.thread,
        ffi,
        mci.core.code.modules,
@@ -17,6 +18,7 @@ import core.stdc.string,
        mci.core.code.instructions,
        mci.vm.intrinsics.declarations,
        mci.vm.memory.base,
+       mci.vm.memory.info,
        mci.vm.memory.layout,
        mci.vm.memory.prettyprint,
        std.c.stdlib,
@@ -27,6 +29,9 @@ import core.stdc.string,
 
 extern (C) void* memcpy(void*, const void*, size_t);
 extern (C) void rt_moduleTlsCtor();
+
+alias calloc _calloc;
+alias free _free;
 
 static if (operatingSystem == OperatingSystem.windows)
 {
@@ -40,7 +45,7 @@ else
 final class InterpreterResult
 {
     Type resultType;
-    RuntimeObject result;
+    ubyte[] result;
 }
 
 final class InterpreterContext
@@ -49,13 +54,21 @@ final class InterpreterContext
     public BasicBlock block;
     public int instructionIndex;
     public InterpreterContext returnContext;
-    public RuntimeObject returnMem;
-    public RuntimeObject[] args;
+    public ubyte* returnMem;
+    public ubyte*[] args;
     public int _argIndex;
-    private Dictionary!(Register, RuntimeObject, false) _registerState;
+    private Dictionary!(Register, ubyte*, false) _registerState;
     private int _numPushs;
     private Interpreter _interpreter;
 
+    public ReadOnlyIndexable!Type HACK_paramToTypeList(ReadOnlyIndexable!Parameter params)
+    {
+        NoNullList!Type res = new NoNullList!Type();
+        foreach (p; params)
+            res.add(p.type);
+
+        return res;
+    }
 
     public void gotoBlock(BasicBlock b)
     {
@@ -73,34 +86,19 @@ final class InterpreterContext
         gotoBlock("entry");
     }
 
-    private void allocateVectorMem(Register reg)
-    {
-        if (auto vec = cast(VectorType)reg.type)
-        {
-            // allocate vector data as well
-            auto mem = getValue(reg);
-            auto vecsize = computeSize(vec.elementType, is32Bit) * vec.elements;
-            //writefln("  Allocating %s additional bytes for data", vecsize);
-            *cast(ubyte**)mem.data = (new ubyte[vecsize]).ptr;
-        }
-    }
-
     public this (Function f, Interpreter interpreter, bool jumpToEntry = true)
     {
         _interpreter = interpreter;
         fun = f;
 
-        _registerState = new Dictionary!(Register, RuntimeObject, false)();
+        _registerState = new Dictionary!(Register, ubyte*, false)();
         foreach (namereg; f.registers)
         {
             auto reg = namereg.y;
+
             auto size = computeSize(reg.type, is32Bit);
-            //writefln("Allocating %s bytes %s for %s [%s]", size, reg.type.name, reg.name, cast(void*)reg);
-
-            auto mem = _interpreter.gcallocate(reg.type, size);
+            auto mem = cast(ubyte*)_calloc(1, size);
             _registerState.add(reg, mem);
-
-            allocateVectorMem(reg);
         }
 
         if (jumpToEntry)
@@ -109,15 +107,19 @@ final class InterpreterContext
 
     public ubyte* arrayElement(Register arrayReg, Register indexReg, out uint size)
     {
-        auto array = *cast(ubyte**)getValue(arrayReg).data;
-        auto index = *cast(size_t*)getValue(indexReg).data;
+        auto arrayRto = *cast(RuntimeObject*)getValue(arrayReg);
+        auto array = arrayRto.data;
+        auto index = *cast(size_t*)getValue(indexReg);
 
         auto typ = arrayReg.type;
 
         if (auto vec = cast(VectorType)typ)
             size = computeSize(vec.elementType, is32Bit);
         else
+        {
+            array += computeSize(NativeUIntType.instance, is32Bit);
             size = computeSize((cast(ArrayType)typ).elementType, is32Bit);
+        }
 
         return array + index * size;
     }
@@ -125,242 +127,111 @@ final class InterpreterContext
     public void loadRegister(T)(Register reg, InstructionOperand value)
     {
         auto src = value.peek!T();
-        auto dst = cast(T*)_registerState[reg].data;
+        auto dst = cast(T*)_registerState[reg];
         *dst = *src;
     }
 
     public void loadArray(T)(Register reg, InstructionOperand value)
     {
         auto data = *value.peek!(ReadOnlyIndexable!T)();
-        gcallocate(reg, data.count);
-        auto mem = *cast(T**)(getValue(reg).data);
+        allocate(reg, data.count);
+
+        auto dst = getValue(reg);
+        if (isType!PointerType(reg.type))
+            dst = *cast(ubyte**)(dst);
+        else 
+        {
+            dst = (cast(RuntimeObject)dst).data;
+            if (isType!ArrayType(reg.type))
+                dst += computeSize(NativeUIntType.instance, is32Bit);
+        }
+
+        auto mem = cast(T*)dst;
+        
         foreach (idx, value; data)
             mem[idx] = value;
     }
 
-    public void blockCopy(RuntimeObject destination, RuntimeObject source, 
-                          int destinationOffset, int sourceOffset, int size)
-    {
-        auto src = cast(ubyte*)source.data + sourceOffset;
-        auto dst = cast(ubyte*)destination.data + destinationOffset;
-        memcpy(dst, src, size);
-    }
-
-    public void blockCopy(Register destination, Register source, 
-                          int destinationOffset, int sourceOffset, int size)
-    {
-        blockCopy(_registerState[destination], _registerState[source],
-                  destinationOffset, sourceOffset, size);
-    }
-
-    public RuntimeObject getValue(Register reg)
+    public ubyte* getValue(Register reg)
     {
         return _registerState[reg];
     }
 
     public void popArg(Register target)
     {
-        blockCopy(_registerState[target], args[_argIndex++], 0, 0, computeSize(target.type, is32Bit));
+        auto size = computeSize(target.type, is32Bit);
+        memcpy(_registerState[target], args[_argIndex++], size);
     }
 
     public void releaseLocals()
     {
         foreach (r; _registerState.values())
-            _interpreter.gcfree(r);
+            _free(r);
     }
 
     struct NullType {};
-
-    private void unaryDispatcher2(string fun, T = NullType)(Register r, T userData)
-    {
-        auto mem = getValue(r).data;
-        auto typ = r.type;
-
-        static if (is(T == NullType))
-        {
-            enum string arg = "";
-            enum string pass = "";
-        }
-        else 
-        {
-            enum string arg = "T, ";
-            enum string pass = ", userData";
-        }
-
-        enum string codeI8 = fun ~ "!(" ~ arg ~ "byte)(cast(byte*)mem" ~ pass ~ ");";
-        static if (__traits(compiles, { mixin(codeI8); }))
-        {
-            if (isType!Int8Type(typ))
-            {
-                mixin (codeI8);
-                return;
-            }
-        }
-
-        enum string codeUI8 = fun ~ "!(" ~ arg ~ "ubyte)(cast(ubyte*)mem" ~ pass ~ ");";
-        static if (__traits(compiles, { mixin(codeUI8); }))
-        {
-            if (isType!UInt8Type(typ))
-            {
-                mixin (codeUI8);
-                return;
-            }
-        }
-
-        enum string codeI16 = fun ~ "!(" ~ arg ~ "short)(cast(short*)mem" ~ pass ~ ");";
-        static if (__traits(compiles, { mixin(codeI16); }))
-        {
-            if (isType!Int16Type(typ))
-            {
-                mixin (codeI16);
-                return;
-            }
-        }
-
-        enum string codeUI16 = fun ~ "!(" ~ arg ~ "ushort)(cast(ushort*)mem" ~ pass ~ ");";
-        static if (__traits(compiles, { mixin(codeUI16); }))
-        {
-            if (isType!UInt16Type(typ))
-            {
-                mixin (codeUI16);
-                return;
-            }
-        }
-
-        enum string codeI32 = fun ~ "!(" ~ arg ~ "int)(cast(int*)mem" ~ pass ~ ");";
-        static if (__traits(compiles, { mixin(codeI32); }))
-        {
-            if (isType!Int32Type(typ))
-            {
-                mixin (codeI32);
-                return;
-            }
-        }
-
-        enum string codeUI32 = fun ~ "!(" ~ arg ~ "uint)(cast(uint*)mem" ~ pass ~ ");";
-        static if (__traits(compiles, { mixin(codeUI32); }))
-        {
-            if (isType!UInt32Type(typ))
-            {
-                mixin (codeUI32);
-                return;
-            }
-        }
-
-        enum string codeI64 = fun ~ "!(" ~ arg ~ "long)(cast(long*)mem" ~ pass ~ ");";
-        static if (__traits(compiles, { mixin(codeI64); }))
-        {
-            if (isType!Int64Type(typ))
-            {
-                mixin (codeI64);
-                return;
-            }
-        }
-
-        enum string codeUI64 = fun ~ "!(" ~ arg ~ "ulong)(cast(ulong*)mem" ~ pass ~ ");";
-        static if (__traits(compiles, { mixin(codeUI64); }))
-        {
-            if (isType!UInt64Type(typ))
-            {
-                mixin (codeUI64);
-                return;
-            }
-        }
-
-        enum string codeFloat32 = fun ~ "!(" ~ arg ~ "float)(cast(float*)mem" ~ pass ~ ");";
-        static if (__traits(compiles, { mixin(codeFloat32); }))
-        {
-            if (isType!Float32Type(typ))
-            {
-                mixin (codeFloat32);
-                return;
-            }
-        }
-
-        enum string codeFloat64 = fun ~ "!(" ~ arg ~ "double)(cast(double*)mem" ~ pass ~ ");";
-        static if (__traits(compiles, { mixin(codeFloat64); }))
-        {
-            if (isType!Float64Type(typ))
-            {
-                mixin (codeFloat64);
-                return;
-            }
-        }
-
-        enum string codeNativeUInt = fun ~ "!(" ~ arg ~ "size_t)(cast(size_t*)mem" ~ pass ~ ");";
-        static if (__traits(compiles, { mixin(codeNativeUInt); }))
-        {
-            if (isType!NativeUIntType(typ))
-            {
-                mixin (codeNativeUInt);
-                return;
-            }
-        }
-
-        enum string codeNativeInt = fun ~ "!(" ~ arg ~ "isize_t)(cast(isize_t*)mem" ~ pass ~ ");";
-        static if (__traits(compiles, { mixin(codeNativeInt); }))
-        {
-            if (isType!NativeIntType(typ))
-            {
-                mixin (codeNativeUInt);
-                return;
-            }
-        }
-
-        enum string codePointer = fun ~ "!(" ~ arg ~ "void*)(cast(void**)mem" ~ pass ~ ");";
-        static if (__traits(compiles, { mixin(codePointer); }))
-        {
-            if (isType!PointerType(typ))
-            {
-                mixin (codePointer);
-                return;
-            }
-        }
-
-        throw new InterpreterException("Dispatcher cannot deal with " ~ typ.name ~ " yet.");
-    }
-
-    private void unaryDispatcher(string fun)(Register r)
-    {
-        unaryDispatcher2!fun(r, NullType());
-    }
-
-    private struct BinaryContext(string fun)
-    {
-        enum string f = fun;
-        Register r2;
-    }
-
-    private struct BinaryResult(string fun, T)
-    {
-        enum string f = fun;
-        T* t;
-    }
-
-    private void binaryWrapper2(Ctx, T)(T* t, Ctx res)
-    {
-        mixin(Ctx.f ~ "!(pointerTarget!(typeof(res.t)), T)(res.t, t);" );
-    }
-
-    private void binaryWrapper(Ctx, T)(T* t, Ctx r2) 
-    {
-        BinaryResult!(Ctx.f, T) res;
-        res.t = t;
-        unaryDispatcher2!("binaryWrapper2", typeof(res))(r2.r2, res);
-    } 
-
-    private void binaryDispatcher(string fun)(Register r1, Register r2)
-    {
-        BinaryContext!fun ctx;
-        ctx.r2 = r2;
-        unaryDispatcher2!("binaryWrapper", typeof(ctx))(r1, ctx);
-    }
 
 
     private void doConv(T1, T2)(T1 *t1, T2 *t2)
     {
         //writefln("conv " ~ T2.stringof ~ " [%s] -> " ~ T1.stringof, *t2);
         *t1 = cast(T1)*t2;
+    }
+
+
+
+    private void binaryDispatcher2(string fun, T1=NullType, T2=NullType)(Type t1, Type t2, ubyte* r1, ubyte* r2)
+    {
+        static if(is(T1 == NullType))
+        {
+            if (isType!Int8Type(t1))
+                return binaryDispatcher2!(fun, T2, byte)(t2, null, r1, r2);
+
+            if (isType!UInt8Type(t1))
+                return binaryDispatcher2!(fun, T2, ubyte)(t2, null, r1, r2);
+
+            if (isType!Int16Type(t1))
+                return binaryDispatcher2!(fun, T2, short)(t2, null, r1, r2);
+
+            if (isType!UInt16Type(t1))
+                return binaryDispatcher2!(fun, T2, ushort)(t2, null, r1, r2);
+
+            if (isType!Int32Type(t1))
+                return binaryDispatcher2!(fun, T2, int)(t2, null, r1, r2);
+
+            if (isType!UInt32Type(t1))
+                return binaryDispatcher2!(fun, T2, uint)(t2, null, r1, r2);
+
+            if (isType!Int64Type(t1))
+                return binaryDispatcher2!(fun, T2, long)(t2, null, r1, r2);
+
+            if (isType!UInt64Type(t1))
+                return binaryDispatcher2!(fun, T2, ulong)(t2, null, r1, r2);
+
+            if (isType!Float32Type(t1))
+                return binaryDispatcher2!(fun, T2, float)(t2, null, r1, r2);
+
+            if (isType!Float64Type(t1))
+                return binaryDispatcher2!(fun, T2, double)(t2, null, r1, r2);
+
+            if (isType!NativeUIntType(t1))
+                return binaryDispatcher2!(fun, T2, size_t)(t2, null, r1, r2);
+
+            if (isType!NativeIntType(t1))
+                return binaryDispatcher2!(fun, T2, isize_t)(t2, null, r1, r2);
+
+            if (isType!PointerType(t1))
+                return binaryDispatcher2!(fun, T2, ubyte*)(t2, null, r1, r2);
+
+            if (isType!FunctionPointerType(t1))
+                return binaryDispatcher2!(fun, T2, ubyte*)(t2, null, r1, r2);
+
+            throw new InterpreterException("Dispatcher cannot deal with " ~ t1.name ~ " yet.");
+        } else
+        {
+            enum string code = fun ~ "!(T2, T1)(cast(T2*)r2, cast(T1*)r1);";
+            mixin(code);
+        }
     }
 
     // highlevel D emulation of common ALU instuctions
@@ -425,12 +296,12 @@ final class InterpreterContext
     private void emulateALU(string op, bool binary)(Instruction inst)
     {
         auto lhsType = inst.sourceRegister1.type;
-        auto lhsMem = getValue(inst.sourceRegister1).data;
+        auto lhsMem = getValue(inst.sourceRegister1);
         ubyte* rhsMem = null;
-        auto dstMem = getValue(inst.targetRegister).data;
+        auto dstMem = getValue(inst.targetRegister);
 
         static if (binary)
-            rhsMem = cast(ubyte*)getValue(inst.sourceRegister2).data;
+            rhsMem = cast(ubyte*)getValue(inst.sourceRegister2);
 
         if (auto vec = cast(VectorType)lhsType)
         {
@@ -457,12 +328,12 @@ final class InterpreterContext
     private void emulateLogic(string op, bool binary)(Instruction inst)
     {
         auto lhsType = inst.sourceRegister1.type;
-        auto lhsMem = getValue(inst.sourceRegister1).data;
+        auto lhsMem = getValue(inst.sourceRegister1);
         ubyte* rhsMem = null;
-        auto dstMem = getValue(inst.targetRegister).data;
+        auto dstMem = getValue(inst.targetRegister);
 
         static if (binary)
-            rhsMem = cast(ubyte*)getValue(inst.sourceRegister2).data;
+            rhsMem = cast(ubyte*)getValue(inst.sourceRegister2);
 
         if (auto vec = cast(VectorType)lhsType)
         {
@@ -486,12 +357,12 @@ final class InterpreterContext
     }
 
 
-    private RuntimeObject[] collectArgs()
+    private ubyte*[] collectArgs()
     {
         if (_numPushs == 0)
             return null;
 
-        auto args = new RuntimeObject[_numPushs];
+        auto args = new ubyte*[_numPushs];
         for (auto i = 0; i < _numPushs; i++)
         {
             auto reg = block.instructions[instructionIndex - _numPushs - 1 + i].sourceRegister1;
@@ -509,11 +380,11 @@ final class InterpreterContext
 
         ubyte *dst = null;
         if (intrinsic.returnType)
-            dst = callCtx.getValue(inst.targetRegister).data;
+            dst = callCtx.getValue(inst.targetRegister);
 
         auto fptr = intrinsicFunctions[intrinsic];
 
-        _interpreter.dispatchFFI(intrinsic, CallingConvention.cdecl, fptr, dst, args); 
+        _interpreter.dispatchFFI(HACK_paramToTypeList(intrinsic.parameters), intrinsic.returnType, CallingConvention.cdecl, fptr, dst, args); 
 
         releaseLocals();
         switchToContext(callCtx);
@@ -534,28 +405,44 @@ final class InterpreterContext
 
         auto callCtx = returnContext;
 
-        ubyte *dst = null;
+        ubyte* dst = null;
         if (fun.returnType)
         {
             auto callInst = callCtx.block.instructions[callCtx.instructionIndex - 1];
-            dst = callCtx.getValue(callInst.targetRegister).data;
+            dst = callCtx.getValue(callInst.targetRegister);
         }
 
-        _interpreter.dispatchFFI(fun, fun.callingConvention, fptr, dst, args);  
+        _interpreter.dispatchFFI(HACK_paramToTypeList(fun.parameters), fun.returnType, fun.callingConvention, fptr, dst, args);
 
         releaseLocals();
         switchToContext(callCtx);
     }
 
+    private void doIndirectFFI(Instruction inst)
+    {
+        auto ffiSig = cast(FunctionPointerType)inst.sourceRegister1.type;
+        auto fptr = *cast(FFIFunction*)getValue(inst.sourceRegister1);
+
+        ubyte* dst = null;
+        if (inst.targetRegister)
+            dst = getValue(inst.targetRegister);
+
+        _interpreter.dispatchFFI(ffiSig.parameterTypes, ffiSig.returnType, fun.callingConvention, fptr, dst, args);
+
+        throw new InterpreterException("Foreign Function Interfacing not supported yet");
+    }
+
+
+    
 
     private void allocate(Register target, size_t count)
     {
         if (auto typ = (cast(PointerType)target.type))
         {
-            auto dst = cast(ubyte**)getValue(target).data;
+            auto dst = cast(ubyte**)getValue(target);
             auto elementType = typ.elementType;
             auto elementSize = computeSize(elementType, is32Bit);
-            auto mem = cast(ubyte*)calloc(count, elementSize);
+            auto mem = cast(ubyte*)_calloc(count, elementSize);
             *dst = mem;
 
             return;
@@ -563,11 +450,23 @@ final class InterpreterContext
 
         if (auto typ = (cast(ArrayType)target.type))
         {
-            auto dst = cast(ubyte**)getValue(target).data;
+            auto dst = cast(ubyte**)getValue(target);
             auto elementType = typ.elementType;
             auto elementSize = computeSize(elementType, is32Bit);
-            auto mem = cast(ubyte*)calloc(count, elementSize);
-            *dst = mem;
+            auto mem = _interpreter.gcallocate(typ, count * elementSize);
+            *dst = cast(ubyte*)mem;
+
+            return;
+        }
+
+        if (auto typ = (cast(VectorType)target.type))
+        {
+            count = typ.elements;
+            auto dst = cast(ubyte**)getValue(target);
+            auto elementType = typ.elementType;
+            auto elementSize = computeSize(elementType, is32Bit);
+            auto mem = _interpreter.gcallocate(typ, count * elementSize);
+            *dst = cast(ubyte*)mem;
 
             return;
         }
@@ -575,31 +474,54 @@ final class InterpreterContext
         throw new InterpreterException("Unsupported allocate target: " ~ target.name);
     }
 
-    private void gcallocate(Register target, size_t count)
+    private void convert(Type srcType, Type dstType, ubyte* srcMem, ubyte* dstMem)
     {
-        if (auto typ = (cast(PointerType)target.type))
+        // Type 7 convert
+        // T[E] -> U[E] for any valid T -> U conversion.
+        if (auto srcVec = cast(VectorType)(srcType))
         {
-            auto dst = cast(ubyte**)getValue(target).data;
-            auto elementType = typ.elementType;
-            auto elementSize = computeSize(elementType, is32Bit);
-            auto mem = _interpreter.gcallocate(elementType, count * elementSize);
-            *dst = mem ? mem.data : null;
+            throw new InterpreterException("Not implemented, yet"); // need to allocate the target vec
+            auto dstVec = cast(VectorType)(dstType);
+
+            srcMem = *cast(ubyte**)srcMem;
+            dstMem = *cast(ubyte**)dstMem;
+
+            auto dstSize = computeSize(dstVec.elementType, is32Bit);
+            auto srcSize = computeSize(srcVec.elementType, is32Bit);
+
+            for (auto i = 0; i < srcVec.elements; i++)
+            {
+                binaryDispatcher2!("doConv")(srcVec.elementType, dstVec.elementType, srcMem, dstMem);
+                srcMem += srcSize;
+                dstMem += dstSize;
+            }
 
             return;
         }
 
-        if (auto typ = (cast(ArrayType)target.type))
-        {
-            auto dst = cast(ubyte**)getValue(target).data;
-            auto elementType = typ.elementType;
-            auto elementSize = computeSize(elementType, is32Bit);
-            auto mem = _interpreter.gcallocate(elementType, count * elementSize);
-            *dst = mem ? mem.data : null;
+        // Type 8 convert (Direct conversion as pointer type)
+        // R1(T1, ...) -> R2(U1, ...) for any R1, any R2, and any amount and type of T n and U m.
 
-            return;
-        }
+        // Type 10 convert (Direct conversion as pointer type)
+        // T* -> R(U1, ...) for any T, any R, and any amount and type of Un.
 
-        throw new InterpreterException("Unsupported allocate target: " ~ target.name);
+        // Direct conversions
+
+        // Type 1 convert
+        // T -> U for any primitives T and U (int8, uint8, int16, uint16, int32, uint32, int64, uint64, int, uint, float32, and float64).
+
+        // Type 2 convert
+        // T* -> uint or int for any T.
+
+        // Type 3 convert
+        // uint or int -> T* for any T.
+
+        // Type 4 convert
+        // T* -> U* for any T and any U.
+
+        // Type 9 convert (Direct conversion as pointer type)
+        // R(T1, ...) -> U* for any R, any amount and type of Tn, and any U.
+        binaryDispatcher2!("doConv")(srcType, dstType, srcMem, dstMem);
     }
 
     @property public bool ready()
@@ -611,10 +533,10 @@ final class InterpreterContext
     {
         auto inst = block.instructions[instructionIndex++];
 
-        //writefln("%s.%s: %s", block.name, instructionIndex, inst.toString());
+        //writefln("%s.%s.%s: %s", block.function_.name, block.name, instructionIndex, inst.toString());
 
         // unroll this using metacode if possible for readability
-        switch (inst.opCode.code)
+        final switch (inst.opCode.code)
         {
             case OperationCode.nop:
             case OperationCode.comment:
@@ -716,27 +638,27 @@ final class InterpreterContext
             case OperationCode.loadNull:
                 auto obj = getValue(inst.targetRegister);
                 auto sz = computeSize(inst.targetRegister.type, is32Bit);
-                memset(obj.data, 0, sz);
+                memset(obj, 0, sz);
                 break;
 
             case OperationCode.loadSize:
                 auto size = computeSize(*inst.operand.peek!Type(), is32Bit);
-                *cast(size_t*)getValue(inst.targetRegister).data = size;
+                *cast(size_t*)getValue(inst.targetRegister) = size;
                 break;
 
-            //case OperationCode.loadAlign:
-            //    auto alignment = computeAlignment(*inst.operand.peek!Type(), is32Bit);
-            //    *cast(size_t*)getValue(inst.targetRegister).data = alignment;
-            //    break;
+            case OperationCode.loadAlign:
+                auto alignment = computeAlignment(*inst.operand.peek!Type(), is32Bit);
+                *cast(size_t*)getValue(inst.targetRegister) = alignment;
+                break;
 
             case OperationCode.loadOffset:
                 auto offset = computeOffset(*inst.operand.peek!Field(), is32Bit);
-                *cast(size_t*)getValue(inst.targetRegister).data = offset;
+                *cast(size_t*)getValue(inst.targetRegister) = offset;
                 break;
 
             case OperationCode.fieldGet:
-                auto dest = getValue(inst.targetRegister).data;
-                auto source = getValue(inst.sourceRegister1).data;
+                auto dest = getValue(inst.targetRegister);
+                auto source = getValue(inst.sourceRegister1);
                 auto field = *inst.operand.peek!Field();
                 auto offset = computeOffset(field, is32Bit);
                 auto size = computeSize(field.type, is32Bit); 
@@ -750,8 +672,8 @@ final class InterpreterContext
                 break;
 
             case OperationCode.fieldSet:
-                auto dest = getValue(inst.sourceRegister1).data;
-                auto source = getValue(inst.sourceRegister2).data;
+                auto dest = getValue(inst.sourceRegister1);
+                auto source = getValue(inst.sourceRegister2);
                 auto field = *inst.operand.peek!Field();
                 auto offset = computeOffset(field, is32Bit);
                 auto size = computeSize(field.type, is32Bit);
@@ -765,8 +687,8 @@ final class InterpreterContext
                 break;
 
             case OperationCode.fieldAddr:
-                auto dest = getValue(inst.targetRegister).data;
-                auto source = getValue(inst.sourceRegister1).data;
+                auto dest = getValue(inst.targetRegister);
+                auto source = getValue(inst.sourceRegister1);
                 auto field = *inst.operand.peek!Field();
                 auto offset = computeOffset(field, is32Bit);
                 auto size = computeSize(field.type, is32Bit); 
@@ -781,7 +703,7 @@ final class InterpreterContext
 
             case OperationCode.fieldGGet:
                 auto field = *inst.operand.peek!Field();
-                auto dest = getValue(inst.targetRegister).data;
+                auto dest = getValue(inst.targetRegister);
                 auto source = _interpreter.getGlobal(field);
                 auto size = computeSize(field.type, is32Bit); 
                 memcpy(dest, source, size);
@@ -789,7 +711,7 @@ final class InterpreterContext
 
             case OperationCode.fieldGSet:
                 auto field = *inst.operand.peek!Field();
-                auto source = getValue(inst.sourceRegister1).data;
+                auto source = getValue(inst.sourceRegister1);
                 auto dest = _interpreter.getGlobal(field);
                 auto size = computeSize(field.type, is32Bit); 
                 memcpy(dest, source, size);
@@ -797,7 +719,7 @@ final class InterpreterContext
 
             case OperationCode.fieldGAddr:
                 auto field = *inst.operand.peek!Field();
-                auto dest = getValue(inst.targetRegister).data;
+                auto dest = getValue(inst.targetRegister);
                 auto source = _interpreter.getGlobal(field);
                 auto size = computeSize(field.type, is32Bit); 
                 *cast(ubyte**)dest = source;
@@ -835,11 +757,9 @@ final class InterpreterContext
             case OperationCode.callIndirect:
             case OperationCode.invokeIndirect:
                 auto funType = cast(FunctionPointerType)inst.sourceRegister1.type;
-                auto funPtr = getValue(inst.sourceRegister1).data;
+                auto funPtr = getValue(inst.sourceRegister1);
 
-                // TODO: impl this check as soon zor added the functionality
-                //if (funType.callingConvention == CallingConvention.queueCall)
-                if (true)
+                if (funType.callingConvention == CallingConvention.standard)
                 {
                     auto target = *cast(Function*)funPtr;
                     auto subContext = new InterpreterContext(target, _interpreter);
@@ -848,7 +768,7 @@ final class InterpreterContext
                     switchToContext(subContext);
                 } 
                 else
-                    throw new InterpreterException("Foreign Function Interfacing not supported yet");
+                    doIndirectFFI(inst);
                 break;
 
             case OperationCode.callTail:
@@ -916,8 +836,8 @@ final class InterpreterContext
                 //auto dst = returnContext.getValue(callInst.targetRegister);
                 //auto size = computeSize(callInst.targetRegister.type, is32Bit);
                 
-                auto size = computeSize(returnMem.type, is32Bit);
-                blockCopy(returnMem, src, 0, 0, size);
+                auto size = computeSize(inst.sourceRegister1.type, is32Bit);
+                memcpy(returnMem, src, size);
 
                 releaseLocals();
                 switchToContext(returnContext);
@@ -934,61 +854,19 @@ final class InterpreterContext
                 {
                     // debug instruction
                     auto arg = inst.sourceRegister1;
-                    writeln( prettyPrint(arg.type, is32Bit, getValue(arg).data, arg.name ) );
+                    writeln( prettyPrint(arg.type, is32Bit, getValue(arg), arg.name ) );
                 } 
                 else
                 {
-                    // TODO: 
-                    // handle conversion from array to ptr
-                    // handle conversion from ptr to array
-
-
-                    // Type 5 & 6 convert
-                    // T* -> T[] for any T.
-                    // T[] -> T* for any T.
-                    if ((isType!(PointerType)(inst.sourceRegister1.type) && isType!(ArrayType)(inst.targetRegister.type)) || 
-                        (isType!(ArrayType)(inst.sourceRegister1.type) && isType!(PointerType)(inst.targetRegister.type)))
-                    {
-                        // plain copy
-                        auto dst = getValue(inst.targetRegister).data;
-                        auto src = getValue(inst.sourceRegister1).data;
-                        *cast(ubyte**)dst = *cast(ubyte**)src;
-                        break;
-                    }
-
-                    // Type 7 convert (TODO)
-                    // T[E] -> U[E] for any valid T -> U conversion.
-
-                    // Type 8 convert (TODO)
-                    // R1(T1, ...) -> R2(U1, ...) for any R1, any R2, and any amount and type of T n and U m.
-
-                    // Type 10 convert (TODO)
-                    // T* -> R(U1, ...) for any T, any R, and any amount and type of Un.
-
-
-                    // Direct conversions
-
-                    // Type 1 convert
-                    // T -> U for any primitives T and U (int8, uint8, int16, uint16, int32, uint32, int64, uint64, int, uint, float32, and float64).
-
-                    // Type 2 convert
-                    // T* -> uint or int for any T.
-
-                    // Type 3 convert
-                    // uint or int -> T* for any T.
-
-                    // Type 4 convert
-                    // T* -> U* for any T and any U.
-
-                    // Type 9 convert
-                    // R(T1, ...) -> U* for any R, any amount and type of Tn, and any U.
-                    binaryDispatcher!"doConv"(inst.targetRegister, inst.sourceRegister1);
+                    auto srcMem = getValue(inst.sourceRegister1);
+                    auto dstMem = getValue(inst.targetRegister);
+                    convert(inst.sourceRegister1.type, inst.targetRegister.type, srcMem, dstMem);
                 }
                 break;
 
             case OperationCode.arraySet:
                 {
-                    auto src   = getValue(inst.sourceRegister3).data;
+                    auto src   = getValue(inst.sourceRegister3);
                     uint size;
                     auto dst = arrayElement(inst.sourceRegister1, inst.sourceRegister2, size);
 
@@ -998,7 +876,7 @@ final class InterpreterContext
 
             case OperationCode.arrayGet:
                 {
-                    auto dst   = getValue(inst.targetRegister).data;
+                    auto dst = getValue(inst.targetRegister);
                     uint size;
                     auto src = arrayElement(inst.sourceRegister1, inst.sourceRegister2, size);
 
@@ -1008,11 +886,24 @@ final class InterpreterContext
 
             case OperationCode.arrayAddr:
                 {
-                    auto dst   = getValue(inst.targetRegister).data;
+                    auto dst = getValue(inst.targetRegister);
                     uint size;
                     auto src = arrayElement(inst.sourceRegister1, inst.sourceRegister2, size);
 
                     *cast(ubyte**)dst = src;
+                    break;
+                }
+
+            case OperationCode.arrayLen:
+                {
+                    auto dst = getValue(inst.targetRegister);
+                    if (auto vec = cast(VectorType)inst.sourceRegister1.type)
+                    {
+                        *cast(size_t*)dst = vec.elements;
+                        break;
+                    }
+                    auto array = (*cast(RuntimeObject*)getValue(inst.sourceRegister1)).data;
+                    *cast(size_t*)dst = *cast(size_t*)array;
                     break;
                 }
 
@@ -1021,7 +912,7 @@ final class InterpreterContext
                 break;
 
             case OperationCode.jumpCond:
-                auto value = *cast(size_t*)getValue(inst.sourceRegister1).data;
+                auto value = *cast(size_t*)getValue(inst.sourceRegister1);
                 auto goals = *inst.operand.peek!(Tuple!(BasicBlock, BasicBlock))();
                 if (value != 0)
                     gotoBlock(goals.x);
@@ -1030,60 +921,66 @@ final class InterpreterContext
                 break;
 
             case OperationCode.memAlloc:
-                auto count = *cast(size_t*)getValue(inst.sourceRegister1).data;
+                auto count = *cast(size_t*)getValue(inst.sourceRegister1);
                 allocate(inst.targetRegister, count);
                 break;
 
             case OperationCode.memNew:
                 allocate(inst.targetRegister, 1);
-                allocateVectorMem(inst.targetRegister);
                 break;
 
+                /*
             case OperationCode.memGCAlloc:
             case OperationCode.memSAlloc:
-                auto count = *cast(size_t*)getValue(inst.sourceRegister1).data;
+                auto count = *cast(size_t*)getValue(inst.sourceRegister1);
                 gcallocate(inst.targetRegister, count);
                 break;
 
             case OperationCode.memGCNew:
             case OperationCode.memSNew:
                 gcallocate(inst.targetRegister, 1);
-                allocateVectorMem(inst.targetRegister);
                 break;
+                */
+
+            case OperationCode.memPin:
+            case OperationCode.memUnpin:
+                break; // currently the interpreter keeps mem pinned during whole lifetime
 
 
             case OperationCode.memSet:
                 auto size = computeSize(inst.sourceRegister2.type, is32Bit);
-                auto dst = *cast(ubyte**)getValue(inst.sourceRegister1).data;
-                auto src = getValue(inst.sourceRegister2).data;
+                auto dst = *cast(ubyte**)getValue(inst.sourceRegister1);
+                auto src = getValue(inst.sourceRegister2);
                 memcpy(dst, src, size);
 
                 break;
 
             case OperationCode.memGet:
                 auto size = computeSize(inst.targetRegister.type, is32Bit);
-                auto src = *cast(ubyte**)getValue(inst.sourceRegister1).data;
-                auto dst = getValue(inst.targetRegister).data;
+                auto src = *cast(ubyte**)getValue(inst.sourceRegister1);
+                auto dst = getValue(inst.targetRegister);
                 memcpy(dst, src, size);
                 break;
 
             case OperationCode.memFree:
-                auto mem = *cast(ubyte**)getValue(inst.sourceRegister1).data;
-                free(mem);
+                auto mem = *cast(ubyte**)getValue(inst.sourceRegister1);
+                _free(mem);
                 break;
 
+                /*
             case OperationCode.memGCFree:
-                auto rtoDataPointer = getValue(inst.sourceRegister1).data;
+                auto rtoDataPointer = getValue(inst.sourceRegister1);
                 if (!rtoDataPointer)
                     break;
                 auto mem = *cast(ubyte**)rtoDataPointer;
                 auto rto = RuntimeObject.fromData(mem);
                 _interpreter.gcfree(rto);
                 break;
+                */
 
             case OperationCode.memAddr:
-                auto mem = getValue(inst.sourceRegister1).data;
-                auto dst = cast(ubyte**)getValue(inst.targetRegister).data;
+                auto mem = getValue(inst.sourceRegister1);
+                auto dst = cast(ubyte**)getValue(inst.targetRegister);
                 *dst = mem;
                 break;
 
@@ -1115,7 +1012,13 @@ final class InterpreterContext
                 doFFI(inst);
                 break;
 
-            default:
+            case OperationCode.phi:
+                throw new InterpreterException("Phi is invalid in executable ial");
+
+            case OperationCode.exThrow:
+            case OperationCode.exTry:
+            case OperationCode.exHandle:
+            case OperationCode.exEnd:
                 throw new InterpreterException("Unsupported opcode: " ~ inst.opCode.name);
         }
     }
@@ -1294,33 +1197,34 @@ public final class Interpreter
             if (auto cache = tlsGlobals.get(key))
                 return *cache;
 
-            return tlsGlobals[key] = cast(ubyte*)calloc(1, computeSize(f.type, is32Bit));
+            return tlsGlobals[key] = cast(ubyte*)_calloc(1, computeSize(f.type, is32Bit));
         } 
         else synchronized(_globals)
         {
             if (auto cache = _globals.get(f))
                 return *cache;
 
-            return _globals[f] = cast(ubyte*)calloc(1, computeSize(f.type, is32Bit));
+            return _globals[f] = cast(ubyte*)_calloc(1, computeSize(f.type, is32Bit));
         }
     }
 
 
-    private RuntimeObject[] serializeArgs(ReadOnlyIndexable!Parameter params, ubyte** argMem)
+    private ubyte*[] serializeArgs(ReadOnlyIndexable!Parameter params, ubyte** argMem)
     {
-        auto args = new RuntimeObject[params.count];
+        auto args = new ubyte*[params.count];
 
         foreach (idx, p; params)
         {
             auto size = computeSize(p.type, is32Bit);
-            auto arg = gcallocate(p.type, size);
-            memcpy(arg.data, argMem[idx], size);
+            auto arg = cast(ubyte*)_calloc(1, size);
+            memcpy(arg, argMem[idx], size);
             args[idx] = arg;
         }
 
         return args;
     }
 
+    // TODO: use returnMem directly once everything works again
     private void runFunction(Function function_, ubyte *returnMem, ubyte** argMem)
     {
         auto context = new InterpreterContext(function_, this);
@@ -1333,7 +1237,7 @@ public final class Interpreter
         if (returnType)
         {
             returnSize = computeSize(returnType, is32Bit);
-            context.returnMem = gcallocate(returnType, returnSize);
+            context.returnMem = cast(ubyte*)_calloc(1, returnSize);
         }
 
         // run
@@ -1342,15 +1246,13 @@ public final class Interpreter
 
         // marshal and free up
         foreach (arg; context.args)
-            gcfree(arg);
+            _free(arg);
 
         if (returnType)
         {
-            memcpy(returnMem, context.returnMem.data, returnSize);
-            gcfree(context.returnMem);
+            memcpy(returnMem, context.returnMem, returnSize);
+            _free(context.returnMem);
         }
-
-        context.releaseLocals();
     }
 
     private FFIClosure getClosure(Function function_)
@@ -1392,9 +1294,12 @@ public final class Interpreter
     }
 
 
-    public RuntimeObject gcallocate(Type t, size_t size)
+    public RuntimeObject gcallocate(Type t, size_t additionalSize)
     {
-        return _gc.allocate(t, size);
+        auto typeInfo = getTypeInfo(t, is32Bit);
+        auto r = _gc.allocate(typeInfo, additionalSize);
+        _gc.pin(r);
+        return r;
     }
 
     public void gcfree(RuntimeObject r)
@@ -1431,17 +1336,22 @@ public final class Interpreter
 
     private Function toFunction(ubyte *mem)
     {
-        auto fun = cast(Function)(*cast(ubyte**)mem);
-
-        // TODO:
+        // auto fun = cast(Function)(*cast(ubyte**)mem);
         // Unfortunatley D wont validate the above cast. 
         // We have to do this by ourself here by walking over all currently loaded functions.
         // At the moment we just assume it always is a Function.
         // This wont allow code passing native funcpointers around for the moment.
         //
         // Solution: use the XRefVisitor to collect all funcs during startup and check fun against them
-        
-        return fun;
+
+        // This heuristic should work always in practise.
+        // All Function objects are GC tracked and thus GC.addrOf() should return non null for any.
+        // A pointer to a native entrypoint on the other hand points to code, which address
+        // does not belong to any managed code. Thus addrOf returns null.
+        // This heuristic is likeley more economic than tracking all Functions as suggested above.
+
+        auto fun = *cast(ubyte**)mem;
+        return GC.addrOf(fun) ? cast(Function)fun : null;
     }
 
 
@@ -1460,40 +1370,44 @@ public final class Interpreter
         return mem;
     }
 
-    public void dispatchFFI(Function fun, CallingConvention convention, FFIFunction entry, ubyte *returnMem, RuntimeObject[] args)
+    public void dispatchFFI(ReadOnlyIndexable!Type paramTypes, Type _returnType, CallingConvention convention, 
+                            FFIFunction entry, ubyte *returnMem, ubyte*[] args)
     {
-        auto params = fun.parameters;
-        auto returnType = toFFIType(fun.returnType);
-        auto argTypes = new FFIType*[params.count];
-        auto argMem = new void*[params.count];
+        auto returnType = toFFIType(_returnType);
+        auto argTypes = new FFIType*[paramTypes.count];
+        auto argMem = new void*[paramTypes.count];
         auto cconv = toFFIConvention(convention);
 
-        foreach (idx, p; params)
+        foreach (idx, p; paramTypes)
         {
-            argTypes[idx] = toFFIType(p.type);
-            argMem[idx] = getParamMem(args[idx].data, p.type);
+            argTypes[idx] = toFFIType(p);
+            argMem[idx] = getParamMem(args[idx], p);
         }
 
         ffiCall(entry, returnType, argTypes, returnMem, argMem, cconv); 
     }
 
+    // TODO: cleanup double allocs once stuff works again
     InterpreterResult runFunction(Function fun)
     {
         auto context = new InterpreterContext(fun, this);
         auto returnType = fun.returnType;
         if (returnType)
-            context.returnMem = gcallocate(returnType, computeSize(returnType, is32Bit));
+            context.returnMem = cast(ubyte*)_calloc(1, computeSize(returnType, is32Bit));
         switchToContext(context);
         run();
 
         auto result = new InterpreterResult();
         result.resultType = returnType;
-        result.result = context.returnMem;
+        auto resultSize = computeSize(returnType, is32Bit);
+        result.result = new ubyte[resultSize];
+        memcpy(result.result.ptr, context.returnMem, resultSize);
+        _free(context.returnMem);
 
         if (returnType)
         {
             writeln("The program quitted with:");
-            writeln( prettyPrint( result.resultType, is32Bit, result.result.data, "(return value)" ) );
+            writeln( prettyPrint( result.resultType, is32Bit, result.result.ptr, "(return value)" ) );
         }
         
         return result;
