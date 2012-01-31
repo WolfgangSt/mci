@@ -35,6 +35,7 @@ extern (C) void rt_moduleTlsDtor();
 
 alias calloc _calloc;
 alias free _free;
+alias void delegate() ExceptionHandler;
 
 static if (operatingSystem == OperatingSystem.windows)
 {
@@ -51,11 +52,41 @@ final class InterpreterResult
     ubyte[] result;
 }
 
-final class InterpreterContext
+private struct InstructionPointer
 {
     public Function fun;
     public BasicBlock block;
     public int instructionIndex;
+}
+
+private final class ExceptionRecord
+{
+    public InstructionPointer ip;
+    public Type type;
+    public ubyte* data;
+    private GarbageCollector _gc;
+
+    public this(InterpreterContext ctx, Register exception)
+    {
+        ip = ctx.ip;
+        type = exception.type;
+        _gc = ctx._interpreter._gc;
+
+        data = cast(ubyte*)_calloc(1, nativeIntSize);
+        _gc.addRoot(data);
+
+        *cast(RuntimeObject*)data = *cast(RuntimeObject*)ctx.getValue(exception);
+    }
+
+    public void release()
+    {
+        _gc.removeRoot(data);
+    }
+}
+
+private final class InterpreterContext
+{
+    public InstructionPointer ip;
     public InterpreterContext returnContext;
     public ubyte* returnMem;
     public ubyte*[] args;
@@ -63,7 +94,9 @@ final class InterpreterContext
     private Dictionary!(Register, ubyte*, false) _registerState;
     private int _numPushs;
     private Interpreter _interpreter;
+    private ExceptionHandler _toplevelHandler;
 
+    // TODO: use utilities:getSignature
     public ReadOnlyIndexable!Type HACK_paramToTypeList(ReadOnlyIndexable!Parameter params)
     {
         NoNullList!Type res = new NoNullList!Type();
@@ -75,13 +108,13 @@ final class InterpreterContext
 
     public void gotoBlock(BasicBlock b)
     {
-        block = b;
-        instructionIndex = 0;
+        ip.block = b;
+        ip.instructionIndex = 0;
     }
 
     public void gotoBlock(string name)
     {
-        gotoBlock(fun.blocks[name]);        
+        gotoBlock(ip.fun.blocks[name]);        
     }
 
     public void gotoEntry()
@@ -98,10 +131,11 @@ final class InterpreterContext
         }
     }
 
-    public this (Function f, Interpreter interpreter, bool jumpToEntry = true)
+    public this (Function f, Interpreter interpreter, bool jumpToEntry, ExceptionHandler eh)
     {
         _interpreter = interpreter;
-        fun = f;
+        _toplevelHandler = eh;
+        ip.fun = f;
 
         _registerState = new Dictionary!(Register, ubyte*, false)();
         foreach (namereg; f.registers)
@@ -128,7 +162,7 @@ final class InterpreterContext
             size = computeSize(vec.elementType, is32Bit);
         else
         {
-            array += computeSize(NativeUIntType.instance, is32Bit);
+            array += nativeIntSize;
             size = computeSize((cast(ArrayType)typ).elementType, is32Bit);
         }
 
@@ -171,7 +205,10 @@ final class InterpreterContext
         {
             dst = (*cast(RuntimeObject*)dst).data;
             if (isType!ArrayType(reg.type))
-                dst += computeSize(NativeUIntType.instance, is32Bit);
+            {
+                *cast(size_t*)dst = data.count;
+                dst += nativeIntSize;
+            }
         }
 
         auto mem = cast(T*)dst;
@@ -194,7 +231,7 @@ final class InterpreterContext
     struct NullType {};
 
 
-    private void doConv(T1, T2)(T1 *t1, T2 *t2)
+    private void doConv(T1, T2)(T1* t1, T2* t2)
     {
         //writefln("conv " ~ T2.stringof ~ " [%s] -> " ~ T1.stringof, *t2);
         *t1 = cast(T1)*t2;
@@ -244,6 +281,9 @@ final class InterpreterContext
 
             if (isType!PointerType(t1))
                 return binaryDispatcher2!(fun, T2, ubyte*)(t2, null, r1, r2);
+
+            if (isType!ReferenceType(t1))
+                return binaryDispatcher2!(fun, T2, RuntimeObject*)(t2, null, r1, r2);
 
             if (isType!FunctionPointerType(t1))
                 return binaryDispatcher2!(fun, T2, ubyte*)(t2, null, r1, r2);
@@ -387,7 +427,7 @@ final class InterpreterContext
         auto args = new ubyte*[_numPushs];
         for (auto i = 0; i < _numPushs; i++)
         {
-            auto reg = block.instructions[instructionIndex - _numPushs - 1 + i].sourceRegister1;
+            auto reg = ip.block.instructions[ip.instructionIndex - _numPushs - 1 + i].sourceRegister1;
             args[i] = getValue(reg);
         }
         _numPushs = 0;
@@ -406,10 +446,22 @@ final class InterpreterContext
 
         auto fptr = intrinsicFunctions[intrinsic];
 
-        _interpreter.dispatchFFI(HACK_paramToTypeList(intrinsic.parameters), intrinsic.returnType, CallingConvention.cdecl, fptr, dst, args); 
+        dispatchFFI(HACK_paramToTypeList(intrinsic.parameters), intrinsic.returnType, CallingConvention.cdecl, fptr, dst, args); 
 
         releaseLocals();
         switchToContext(callCtx);
+    }
+
+    private void dispatchFFI(ReadOnlyIndexable!Type paramTypes, Type _returnType, CallingConvention convention, 
+                             FFIFunction entry, ubyte* returnMem, ubyte*[] args)
+    {
+        try
+        {
+           _interpreter.dispatchFFI(paramTypes, _returnType, convention, entry, returnMem, args);
+        } catch (UnwindException)
+        {
+            unwindException();
+        }
     }
 
 
@@ -428,13 +480,13 @@ final class InterpreterContext
         auto callCtx = returnContext;
 
         ubyte* dst = null;
-        if (fun.returnType)
+        if (ip.fun.returnType)
         {
-            auto callInst = callCtx.block.instructions[callCtx.instructionIndex - 1];
+            auto callInst = callCtx.ip.block.instructions[callCtx.ip.instructionIndex - 1];
             dst = callCtx.getValue(callInst.targetRegister);
         }
 
-        _interpreter.dispatchFFI(HACK_paramToTypeList(fun.parameters), fun.returnType, fun.callingConvention, fptr, dst, args);
+        dispatchFFI(HACK_paramToTypeList(ip.fun.parameters), ip.fun.returnType, ip.fun.callingConvention, fptr, dst, args);
 
         releaseLocals();
         switchToContext(callCtx);
@@ -449,7 +501,7 @@ final class InterpreterContext
         if (inst.targetRegister)
             dst = getValue(inst.targetRegister);
 
-        _interpreter.dispatchFFI(ffiSig.parameterTypes, ffiSig.returnType, fun.callingConvention, fptr, dst, args);
+        dispatchFFI(ffiSig.parameterTypes, ffiSig.returnType, ffiSig.callingConvention, fptr, dst, args);
 
         throw new InterpreterException("Foreign Function Interfacing not supported yet");
     }
@@ -506,7 +558,7 @@ final class InterpreterContext
 
     private void convert(Type srcType, Type dstType, ubyte* srcMem, ubyte* dstMem)
     {
-        // Type 5 convert
+        // Type 6 convert
         // T[E] -> U[E] for any valid T -> U conversion.
         if (auto srcVec = cast(VectorType)(srcType))
         {
@@ -545,25 +597,55 @@ final class InterpreterContext
         // Type 4 convert
         // uint or int -> T* for any T.
 
-        // Type 6 convert (Direct conversion as pointer type)
-        // R1(T1, ...) -> R2(U1, ...) for any R1, any R2, and any amount and type of T n and U m.
+        // Type 5 convert
+        // T& -> U& for any T and any U.
 
         // Type 7 convert (Direct conversion as pointer type)
-        // R(T1, ...) -> U* for any R, any amount and type of Tn, and any U.
+        // R1(T1, ...) -> R2(U1, ...) for any R1, any R2, and any amount and type of T n and U m.
 
         // Type 8 convert (Direct conversion as pointer type)
+        // R(T1, ...) -> U* for any R, any amount and type of Tn, and any U.
+
+        // Type 9 convert (Direct conversion as pointer type)
         // T* -> R(U1, ...) for any T, any R, and any amount and type of Un.
         binaryDispatcher2!("doConv")(srcType, dstType, srcMem, dstMem);
     }
 
+    private void unwindException()
+    {
+        auto lastCtx = this;
+        for (auto ctx = this; ctx; ctx = ctx.returnContext)
+        {
+            auto block = ctx.ip.block.unwindBlock;
+            if (block)
+            {
+                // continue execution here
+                ctx.gotoBlock(block);
+                switchToContext(ctx);
+                return;
+            }
+            releaseLocals();
+            lastCtx = ctx;
+        }
+
+        lastCtx._toplevelHandler();
+    }
+
+    private void unwindException(Register exceptionRegister)
+    {
+        auto exception = new ExceptionRecord(this, exceptionRegister);
+        setException(exception);
+        unwindException();
+    }
+
     @property public bool ready()
     {
-        return instructionIndex < block.instructions.count;
+        return ip.instructionIndex < ip.block.instructions.count;
     }
 
     public void step()
     {
-        auto inst = block.instructions[instructionIndex++];
+        auto inst = ip.block.instructions[ip.instructionIndex++];
 
         //writefln("%s.%s.%s: %s", block.function_.name, block.name, instructionIndex, inst.toString());
 
@@ -750,7 +832,7 @@ final class InterpreterContext
             case OperationCode.invoke:
                 auto target = *inst.operand.peek!Function();
 
-                auto subContext = new InterpreterContext(target, _interpreter, false);
+                auto subContext = new InterpreterContext(target, _interpreter, false, null);
                 subContext.returnContext = this;
                 if (inst.opCode.code == OperationCode.call)
                     subContext.returnMem = getValue(inst.targetRegister);
@@ -774,7 +856,7 @@ final class InterpreterContext
                 if (funType.callingConvention == CallingConvention.standard)
                 {
                     auto target = *cast(Function*)funPtr;
-                    auto subContext = new InterpreterContext(target, _interpreter);
+                    auto subContext = new InterpreterContext(target, _interpreter, true, null);
                     subContext.returnContext = this;
                     subContext.args = collectArgs();
                     switchToContext(subContext);
@@ -1003,10 +1085,11 @@ final class InterpreterContext
             case OperationCode.phi:
                 throw new InterpreterException("Phi is invalid in executable ial");
 
-            case OperationCode.exThrow:
-            case OperationCode.exTry:
-            case OperationCode.exHandle:
-            case OperationCode.exEnd:
+            case OperationCode.ehThrow:
+                unwindException(inst.sourceRegister1);
+                break;
+            case OperationCode.ehRethrow:
+            case OperationCode.ehCatch:
                 throw new InterpreterException("Unsupported opcode: " ~ inst.opCode.name);
         }
         
@@ -1019,21 +1102,22 @@ final class InterpreterContext
 // shared data
 
 private __gshared Dictionary!(Type, FFIType*, false) ffiStructTypeCache;
-private Dictionary!(Tuple!(Interpreter, Field), ubyte*, false) tlsGlobals;
+private __gshared size_t nativeIntSize;
+private __gshared UnwindException unwindException;
 
+private class UnwindException : Exception
+{
+    public this()
+    {
+        super("Internal unwind exception", __FILE__, __LINE__);
+    }
+}
 
 shared static this() 
 {
     ffiStructTypeCache = new Dictionary!(Type, FFIType*, false);
-}
-
-static this()
-{    
-    tlsGlobals = new Dictionary!(Tuple!(Interpreter, Field), ubyte*, false);
-}
-
-static ~this()
-{
+    nativeIntSize = computeSize(NativeUIntType.instance, is32Bit);
+    unwindException = new UnwindException();
 }
 
 private FFIType* toFFIType(Type t)
@@ -1127,6 +1211,18 @@ private FFIInterface toFFIConvention(CallingConvention cc)
 // per thread data
 
 private InterpreterContext currentContext;
+private ExceptionRecord currentException;
+private Dictionary!(Tuple!(Interpreter, Field), ubyte*, false) tlsGlobals;
+
+static this()
+{    
+    tlsGlobals = new Dictionary!(Tuple!(Interpreter, Field), ubyte*, false);
+}
+
+static ~this()
+{
+    // need to release all globals belonging to the threads interpreter here
+}
 
 private void step()
 {
@@ -1137,6 +1233,11 @@ private void run()
 {
     while (currentContext && currentContext.ready)
         currentContext.step();
+}
+
+private void setException(ExceptionRecord exception)
+{
+    currentException = exception;
 }
 
 private void switchToContext(InterpreterContext context)
@@ -1153,8 +1254,7 @@ public final class Interpreter
     private GarbageCollector _gc;
     private Dictionary!(Function, FFIClosure, false) _closureCache;
     private Dictionary!(Field, ubyte*, false) _globals;
-    private StackAllocator _stackAlloc;
-    
+    private StackAllocator _stackAlloc;    
 
     public this(GarbageCollector collector)
     {
@@ -1200,6 +1300,18 @@ public final class Interpreter
         }
     }
 
+    private void defaultExceptionHandler()
+    {
+        auto ex = currentException;
+        auto inst = ex.ip.block.instructions[ex.ip.instructionIndex - 1];
+
+        writefln("Unhandled exception thrown at %s.%s.%s: %s", ex.ip.block.function_.name, ex.ip.block.name, ex.ip.instructionIndex - 1, inst.toString());
+        writeln("====================");
+        writeln(prettyPrint(ex.type, is32Bit, ex.data, "exception"));
+        writeln("====================");
+
+        throw new InterpreterException("Unhandled ial exception");
+    }
 
     private ubyte*[] serializeArgs(ReadOnlyIndexable!Parameter params, ubyte** argMem)
     {
@@ -1216,9 +1328,9 @@ public final class Interpreter
         return args;
     }
 
-    private void runFunction(Function function_, ubyte *returnMem, ubyte** argMem)
+    private void runFunction(Function function_, ubyte* returnMem, ubyte** argMem, ExceptionHandler eh)
     {
-        auto context = new InterpreterContext(function_, this);
+        auto context = new InterpreterContext(function_, this, true, eh);
 
         context.args = serializeArgs(function_.parameters, argMem);
         context.returnMem = returnMem;
@@ -1257,6 +1369,13 @@ public final class Interpreter
             argTypes[idx] = toFFIType(p.type);
 
 
+        auto context = currentContext;
+        auto eh = delegate void()
+        {
+            // we need to abort the current FFI here!
+            throw unwindException;           
+        };
+
         // careful, as trampoline invocations from native code consume stack until emulation returns.
         // In case a ffi happens during this emulation with noreturn semantics but rather invoking
         // (semantically a jump instruction within the native code) to another trampoline we will
@@ -1272,7 +1391,7 @@ public final class Interpreter
             }
             _gc.attach();
           
-            runFunction(function_, cast(ubyte*)ret, cast(ubyte**)args);
+            runFunction(function_, cast(ubyte*)ret, cast(ubyte**)args, eh);
         };
 
         auto cconv = toFFIConvention(function_.callingConvention);
@@ -1322,7 +1441,7 @@ public final class Interpreter
         }
     }
 
-    private Function toFunction(ubyte *mem)
+    private Function toFunction(ubyte* mem)
     {
         // auto fun = cast(Function)(*cast(ubyte**)mem);
         // Unfortunatley D wont validate the above cast. 
@@ -1359,7 +1478,7 @@ public final class Interpreter
     }
 
     public void dispatchFFI(ReadOnlyIndexable!Type paramTypes, Type _returnType, CallingConvention convention, 
-                            FFIFunction entry, ubyte *returnMem, ubyte*[] args)
+                            FFIFunction entry, ubyte* returnMem, ubyte*[] args)
     {
         auto returnType = toFFIType(_returnType);
         auto argTypes = new FFIType*[paramTypes.count];
@@ -1378,7 +1497,7 @@ public final class Interpreter
     // TODO: cleanup double allocs once stuff works again
     InterpreterResult runFunction(Function fun)
     {
-        auto context = new InterpreterContext(fun, this);
+        auto context = new InterpreterContext(fun, this, true, &defaultExceptionHandler);
         auto returnType = fun.returnType;
         if (returnType)
             context.returnMem = cast(ubyte*)_calloc(1, computeSize(returnType, is32Bit));
