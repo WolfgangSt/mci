@@ -65,17 +65,28 @@ private final class ExceptionRecord
     public Type type;
     public ubyte* data;
     private GarbageCollector _gc;
+    private InterpreterContext _ctx;
 
     public this(InterpreterContext ctx, Register exception)
     {
         ip = ctx.ip;
         type = exception.type;
         _gc = ctx._interpreter._gc;
+        _ctx = ctx;
 
         data = cast(ubyte*)_calloc(1, nativeIntSize);
         _gc.addRoot(data);
 
         *cast(RuntimeObject*)data = *cast(RuntimeObject*)ctx.getValue(exception);
+    }
+
+    public void printStackTrace()
+    {
+        for (auto ctx = _ctx; ctx; ctx = ctx.returnContext)
+        {
+            auto inst = ctx.ip.block.instructions[ctx.ip.instructionIndex - 1];
+            writefln("%s.%s.%s: %s", ctx.ip.block.function_.name, ctx.ip.block.name, ctx.ip.instructionIndex - 1, inst.toString());
+        }
     }
 
     public void release()
@@ -237,8 +248,6 @@ private final class InterpreterContext
         *t1 = cast(T1)*t2;
     }
 
-
-
     private void binaryDispatcher2(string fun, T1=NullType, T2=NullType)(Type t1, Type t2, ubyte* r1, ubyte* r2)
     {
         static if(is(T1 == NullType))
@@ -289,7 +298,8 @@ private final class InterpreterContext
                 return binaryDispatcher2!(fun, T2, ubyte*)(t2, null, r1, r2);
 
             throw new InterpreterException("Dispatcher cannot deal with " ~ t1.name ~ " yet.");
-        } else
+        } 
+        else
         {
             enum string code = fun ~ "!(T2, T1)(cast(T2*)r2, cast(T1*)r1);";
             mixin(code);
@@ -353,7 +363,6 @@ private final class InterpreterContext
 
         throw new InterpreterException("ALU cannot emulate " ~ op ~ " for " ~ lhsType.name ~ " yet.");
     }
-
 
     private void emulateALU(string op, bool binary)(Instruction inst)
     {
@@ -458,12 +467,18 @@ private final class InterpreterContext
         try
         {
            _interpreter.dispatchFFI(paramTypes, _returnType, convention, entry, returnMem, args);
-        } catch (UnwindException)
+        } 
+        catch (UnwindException)
         {
+            // link the FFIs context.
+            // if we do this at FFI call time we might leak all managed stack frames
+            // in case the FFI has noreturn semantics
+            // The downside of this approach is that stack traces will only work down
+            // to the latest FFI that has been unwound
+            currentContext.returnContext = this;
             unwindException();
         }
     }
-
 
     private void doFFI(Instruction inst)
     {
@@ -505,9 +520,6 @@ private final class InterpreterContext
 
         throw new InterpreterException("Foreign Function Interfacing not supported yet");
     }
-
-
-    
 
     private void allocate(Register target, size_t count)
     {
@@ -647,7 +659,7 @@ private final class InterpreterContext
     {
         auto inst = ip.block.instructions[ip.instructionIndex++];
 
-        //writefln("%s.%s.%s: %s", block.function_.name, block.name, instructionIndex, inst.toString());
+        //writefln("%s.%s.%s: %s", ip.block.function_.name, ip.block.name, ip.instructionIndex - 1, inst.toString());
 
         // unroll this using metacode if possible for readability
         final switch (inst.opCode.code)
@@ -1088,15 +1100,22 @@ private final class InterpreterContext
             case OperationCode.ehThrow:
                 unwindException(inst.sourceRegister1);
                 break;
+
             case OperationCode.ehRethrow:
+                unwindException();
+                break;
+
             case OperationCode.ehCatch:
-                throw new InterpreterException("Unsupported opcode: " ~ inst.opCode.name);
+                *cast(RuntimeObject*)getValue(inst.targetRegister) = *cast(RuntimeObject*)currentException.data;
+                break;
+
+            //default:
+            //    throw new InterpreterException("Unsupported opcode: " ~ inst.opCode.name);
         }
         
         //GC.collect();
     }
 }
-
 
 ////////////////////////////////////////////////////////////////////////////////
 // shared data
@@ -1206,7 +1225,6 @@ private FFIInterface toFFIConvention(CallingConvention cc)
     }
 }
 
-
 ////////////////////////////////////////////////////////////////////////////////
 // per thread data
 
@@ -1244,7 +1262,6 @@ private void switchToContext(InterpreterContext context)
 {
     currentContext = context;
 }
-
 
 ////////////////////////////////////////////////////////////////////////////////
 // interpreter helper
@@ -1306,9 +1323,11 @@ public final class Interpreter
         auto inst = ex.ip.block.instructions[ex.ip.instructionIndex - 1];
 
         writefln("Unhandled exception thrown at %s.%s.%s: %s", ex.ip.block.function_.name, ex.ip.block.name, ex.ip.instructionIndex - 1, inst.toString());
-        writeln("====================");
+        writeln("==========  Exception  ==========");
         writeln(prettyPrint(ex.type, is32Bit, ex.data, "exception"));
-        writeln("====================");
+        writeln("========== Stack Trace ==========");
+        ex.printStackTrace();
+        writeln("=================================");
 
         throw new InterpreterException("Unhandled ial exception");
     }
@@ -1368,8 +1387,6 @@ public final class Interpreter
         foreach (idx, p; params)
             argTypes[idx] = toFFIType(p.type);
 
-
-        auto context = currentContext;
         auto eh = delegate void()
         {
             // we need to abort the current FFI here!
@@ -1401,7 +1418,6 @@ public final class Interpreter
         return closure;
     }
 
-
     public RuntimeObject gcallocate(Type t, size_t additionalSize)
     {
         auto typeInfo = getTypeInfo(t, is32Bit);
@@ -1421,6 +1437,9 @@ public final class Interpreter
             import std.c.windows.windows;
 
             auto libName = toUTFz!(const(wchar)*)(sig.library);
+            if (sig.library == "libc")
+                libName = "msvcrt.dll";
+
             auto impName = toUTFz!(const(char)*)(sig.entryPoint);
             // try GetModuleHandle first
             auto lib = GetModuleHandleW(libName);
@@ -1460,7 +1479,6 @@ public final class Interpreter
         auto fun = *cast(ubyte**)mem;
         return GC.addrOf(fun) ? cast(Function)fun : null;
     }
-
 
     private ubyte* getParamMem(ubyte* mem, Type t)
     {
@@ -1515,7 +1533,8 @@ public final class Interpreter
 
             writeln("The program quitted with:");
             writeln( prettyPrint( result.resultType, is32Bit, result.result.ptr, "(return value)" ) );
-        } else
+        } 
+        else
             writeln("The program quitted without return value.");
         
         return result;

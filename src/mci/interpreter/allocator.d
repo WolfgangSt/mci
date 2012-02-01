@@ -16,7 +16,7 @@ private final class StackAllocatorBlock
     private size_t _size;
     private size_t _wordSize;
     private size_t _load;
-    private ubyte *_mem;
+    private ubyte* _mem;
     private StackAllocatorBlock _predecessor;
     private StackAllocator _allocator;
 
@@ -52,7 +52,7 @@ private final class StackAllocatorBlock
         _allocator._topBlock = _predecessor;
     }
 
-    public ubyte *allocate(size_t size)
+    public ubyte* allocate(size_t size)
     {
         auto newLoad = _load + size;
         if (newLoad > _size)
