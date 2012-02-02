@@ -11,10 +11,22 @@ import mci.core.analysis.utilities,
        std.c.stdlib,
        std.c.string;
 
+
+private __gshared size_t _wordSize;
+
+shared static this()
+{
+    _wordSize = computeSize(NativeUIntType.instance, is32Bit);
+}
+
+private size_t doAlign(size_t value)
+{
+    return (value + _wordSize -1) & -_wordSize;
+}
+
 private final class StackAllocatorBlock
 {
     private size_t _size;
-    private size_t _wordSize;
     private size_t _load;
     private ubyte* _mem;
     private StackAllocatorBlock _predecessor;
@@ -36,7 +48,6 @@ private final class StackAllocatorBlock
         _predecessor = _allocator._topBlock;
         _allocator._topBlock = this;
 
-        _wordSize = computeSize(NativeUIntType.instance, is32Bit);
         _size = sizeInWords * _wordSize;
         _mem = cast(ubyte*)calloc(_size, 1);
         
@@ -108,6 +119,7 @@ public final class StackAllocator
 
     public ubyte* allocate(size_t size)
     {
+        size = doAlign(size);
         if (!_topBlock)
             _topBlock = new StackAllocatorBlock(_defaultAllocationSize, this);
         return _topBlock.allocate(size);
@@ -115,6 +127,7 @@ public final class StackAllocator
 
     public void free(size_t size)
     {
+        size = doAlign(size);
         _topBlock.free(size);
     }
 
