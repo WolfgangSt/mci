@@ -19,6 +19,7 @@ import core.stdc.string,
        mci.core.code.instructions,
        mci.vm.intrinsics.declarations,
        mci.vm.memory.base,
+       mci.vm.memory.entrypoint,
        mci.vm.memory.info,
        mci.vm.memory.layout,
        mci.vm.memory.prettyprint,
@@ -483,7 +484,7 @@ private final class InterpreterContext
     private void doFFI(Instruction inst)
     {
         auto ffisig = *inst.operand.peek!FFISignature();
-        auto fptr = _interpreter.resolveEntryPoint(ffisig);
+        auto fptr = cast(FFIFunction)resolveEntryPoint(ffisig);
 
         if (fptr is null)
             throw new InterpreterException("Cannot resolve export " ~ ffisig.entryPoint ~ " in " ~ ffisig.library);
@@ -559,7 +560,7 @@ private final class InterpreterContext
             auto dst = cast(ubyte**)getValue(target);
             auto elementType = typ.elementType;
             auto elementSize = computeSize(elementType, is32Bit);
-            auto mem = _interpreter.gcallocate(typ, count * elementSize);
+            auto mem = _interpreter.gcallocate(typ, count * elementSize);       
             *dst = cast(ubyte*)mem;
 
             return;
@@ -1428,36 +1429,6 @@ public final class Interpreter
     public void gcfree(RuntimeObject r)
     {
         _gc.free(r);
-    }
-
-    public FFIFunction resolveEntryPoint(FFISignature sig)
-    {
-        static if (operatingSystem == OperatingSystem.windows)
-        {
-            import std.c.windows.windows;
-
-            auto libName = toUTFz!(const(wchar)*)(sig.library);
-            if (sig.library == "libc")
-                libName = "msvcrt.dll";
-
-            auto impName = toUTFz!(const(char)*)(sig.entryPoint);
-            // try GetModuleHandle first
-            auto lib = GetModuleHandleW(libName);
-            if (!lib)
-                lib = LoadLibraryW(libName);
-            return cast(FFIFunction)GetProcAddress(lib, impName);
-        }
-        else
-        {
-            auto libName = toUTFz!(const(char)*)(sig.library);
-            auto impName = toUTFz!(const(char)*)(sig.entryPoint);
-            //auto lib = dlopen(libName, RTLD_NOLOAD);
-
-            //if (lib is null)
-            auto    lib = dlopen(libName, RTLD_LOCAL);
-
-            return cast(FFIFunction)dlsym(lib, impName);
-        }
     }
 
     private Function toFunction(ubyte* mem)

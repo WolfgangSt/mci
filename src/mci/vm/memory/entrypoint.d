@@ -40,14 +40,14 @@ public EntryPoint resolveEntryPoint(FFISignature sig)
         if (isValidFilename(sig.library))
         {
             // try loading locally first
-            libName = toUTFz!(const(char)*)("./" + sig.library);
-            lib = dlopen(libName, RTLD_NOLOAD);
+            libName = toUTFz!(const(char)*)("./" ~ sig.library);
+            lib = dlopen(libName, RTLD_LAZY);
         }
 
         if (lib is null)
         {
             libName = toUTFz!(const(char)*)(sig.library);
-            lib = dlopen(libName, RTLD_LOCAL);
+            lib = dlopen(libName, RTLD_LAZY);
         }
 
         if (lib is null)
