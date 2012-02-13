@@ -38,13 +38,9 @@ alias calloc _calloc;
 alias free _free;
 alias void delegate() ExceptionHandler;
 
-static if (operatingSystem == OperatingSystem.windows)
+static if (isPosix)
 {
-    import std.c.windows.windows;
-} 
-else
-{
-    import std.c.linux.linux;
+    import std.c.linux.linux; 
 }
 
 final class InterpreterResult
@@ -217,10 +213,7 @@ private final class InterpreterContext
         {
             dst = (*cast(RuntimeObject*)dst).data;
             if (isType!ArrayType(reg.type))
-            {
-                *cast(size_t*)dst = data.count;
                 dst += nativeIntSize;
-            }
         }
 
         auto mem = cast(T*)dst;
@@ -549,6 +542,7 @@ private final class InterpreterContext
             auto elementType = typ.elementType;
             auto elementSize = computeSize(elementType, is32Bit);
             auto mem = _interpreter.gcallocate(typ, count * elementSize);
+            *cast(size_t*)mem.data = count;
             *dst = cast(ubyte*)mem;
 
             return;
