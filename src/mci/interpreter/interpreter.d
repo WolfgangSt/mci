@@ -528,6 +528,12 @@ private final class InterpreterContext
         if (auto typ = (cast(PointerType)target.type))
         {
             auto dst = cast(ubyte**)getValue(target);
+            if (count == 0)
+            {
+                *dst = null;
+                return;
+            }
+
             auto elementType = typ.elementType;
             auto elementSize = computeSize(elementType, is32Bit);
             auto mem = cast(ubyte*)_calloc(count, elementSize);
