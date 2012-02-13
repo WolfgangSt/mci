@@ -81,7 +81,7 @@ private final class ExceptionRecord
     {
         for (auto ctx = _ctx; ctx; ctx = ctx.returnContext)
         {
-            auto inst = ctx.ip.block.instructions[ctx.ip.instructionIndex - 1];
+            auto inst = ctx.ip.block.stream[ctx.ip.instructionIndex - 1];
             writefln("%s.%s.%s: %s", ctx.ip.block.function_.name, ctx.ip.block.name, ctx.ip.instructionIndex - 1, inst.toString());
         }
     }
@@ -430,7 +430,7 @@ private final class InterpreterContext
         auto args = new ubyte*[_numPushs];
         for (auto i = 0; i < _numPushs; i++)
         {
-            auto reg = ip.block.instructions[ip.instructionIndex - _numPushs - 1 + i].sourceRegister1;
+            auto reg = ip.block.stream[ip.instructionIndex - _numPushs - 1 + i].sourceRegister1;
             args[i] = getValue(reg);
         }
         _numPushs = 0;
@@ -491,7 +491,7 @@ private final class InterpreterContext
         ubyte* dst = null;
         if (ip.fun.returnType)
         {
-            auto callInst = callCtx.ip.block.instructions[callCtx.ip.instructionIndex - 1];
+            auto callInst = callCtx.ip.block.stream[callCtx.ip.instructionIndex - 1];
             dst = callCtx.getValue(callInst.targetRegister);
         }
 
@@ -647,12 +647,12 @@ private final class InterpreterContext
 
     @property public bool ready()
     {
-        return ip.instructionIndex < ip.block.instructions.count;
+        return ip.instructionIndex < ip.block.stream.count;
     }
 
     public void step()
     {
-        auto inst = ip.block.instructions[ip.instructionIndex++];
+        auto inst = ip.block.stream[ip.instructionIndex++];
 
         //writefln("%s.%s.%s: %s", ip.block.function_.name, ip.block.name, ip.instructionIndex - 1, inst.toString());
 
@@ -1315,7 +1315,7 @@ public final class Interpreter
     private void defaultExceptionHandler()
     {
         auto ex = currentException;
-        auto inst = ex.ip.block.instructions[ex.ip.instructionIndex - 1];
+        auto inst = ex.ip.block.stream[ex.ip.instructionIndex - 1];
 
         writefln("Unhandled exception thrown at %s.%s.%s: %s", ex.ip.block.function_.name, ex.ip.block.name, ex.ip.instructionIndex - 1, inst.toString());
         writeln("==========  Exception  ==========");
