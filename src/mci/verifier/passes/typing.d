@@ -600,6 +600,7 @@ public final class ConversionVerifier : CodeVerifier
             foreach (instr; bb.y.stream)
                 if (instr.opCode is opConv)
                     if (!isConvertibleTo(instr.sourceRegister1.type, instr.targetRegister.type))
+                    if (instr.sourceRegister1.type !is instr.targetRegister.type) // Validate debug instructions. NOTE: this deprecates once debugging interfaces are defined
                         error(instr, "Invalid types in 'conv' operation.");
     }
 }
