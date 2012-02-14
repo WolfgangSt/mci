@@ -4,6 +4,7 @@ import core.stdc.string,
        core.memory,
        core.thread,
        ffi,
+       mci.core.analysis.utilities,
        mci.core.code.modules,
        mci.core.common,
        mci.core.config,
@@ -158,23 +159,61 @@ private final class InterpreterContext
     }
 
     // dereferences an array or vector element
-    public ubyte* arrayElement(Register arrayReg, Register indexReg, out uint size)
+    public ubyte* arrayElement(Register arrayReg, size_t index, out uint size)
     {
+        auto typ = arrayReg.type;
         auto arrayRto = *cast(RuntimeObject*)getValue(arrayReg);
         auto array = arrayRto.data;
-        auto index = *cast(size_t*)getValue(indexReg);
-
-        auto typ = arrayReg.type;
 
         if (auto vec = cast(VectorType)typ)
             size = computeSize(vec.elementType, is32Bit);
-        else
+        else if (auto arr = cast(ArrayType)typ)
         {
             array += nativeIntSize;
-            size = computeSize((cast(ArrayType)typ).elementType, is32Bit);
+            size = computeSize(arr.elementType, is32Bit);
         }
 
         return array + index * size;
+    }
+
+    // dereferences the first element of an array or vector
+    public ubyte* arrayElementFirst(Register arrayReg)
+    {
+        auto arrayRto = *cast(RuntimeObject*)getValue(arrayReg);
+        auto array = arrayRto.data;
+
+        if (auto arr = cast(ArrayType)arrayReg.type)
+            array += nativeIntSize;
+
+        return array;
+    }
+
+    public ubyte* arrayOrPointerElementFirst(Register reg)
+    {
+        if (auto arr = cast(PointerType)reg.type)
+            return *cast(ubyte**)getValue(reg);
+        return arrayElementFirst(reg);
+    }
+
+    // dereferences an array or vector or pointer element
+    public ubyte* arrayElement(Register arrayReg, Register indexReg, out uint size)
+    {
+        auto index = *cast(size_t*)getValue(indexReg);
+        return arrayElement(arrayReg, index, size);
+    }
+
+    // returns the number of elements in an array or vector
+    size_t arrayElements(Register arrayReg)
+    {
+        if (auto arr = cast(VectorType)arrayReg.type)
+        {
+            return arr.elements;
+        }
+        else
+        {
+            auto arrayRto = *cast(RuntimeObject*)getValue(arrayReg);
+            return *cast(size_t*)arrayRto.data;
+        }
     }
 
     // (de)references a struct field given a struct pointer or ref
@@ -205,17 +244,7 @@ private final class InterpreterContext
     {
         auto data = *value.peek!(ReadOnlyIndexable!T)();
         allocate(reg, data.count);
-
-        auto dst = getValue(reg);
-        if (isType!PointerType(reg.type))
-            dst = *cast(ubyte**)(dst);
-        else 
-        {
-            dst = (*cast(RuntimeObject*)dst).data;
-            if (isType!ArrayType(reg.type))
-                dst += nativeIntSize;
-        }
-
+        auto dst = arrayOrPointerElementFirst(reg);
         auto mem = cast(T*)dst;
         
         foreach (idx, value; data)
@@ -235,11 +264,51 @@ private final class InterpreterContext
 
     struct NullType {};
 
-
     private void doConv(T1, T2)(T1* t1, T2* t2)
     {
         //writefln("conv " ~ T2.stringof ~ " [%s] -> " ~ T1.stringof, *t2);
         *t1 = cast(T1)*t2;
+    }
+
+    private T opShL(T)(T l, size_t r)
+    {
+        enum maxBits = T.sizeof * 8;
+        if (r >= maxBits)
+            return 0;
+        return l << r;
+    }
+
+    private T opShR(T)(T l, size_t r)
+    {
+        enum maxBits = T.sizeof * 8;
+        static if (isSigned!T)
+        {
+            if (r >= maxBits)
+                return l >> maxBits;
+            return l >> r;
+        }
+        else
+        {
+            if (r >= maxBits)
+                return 0;
+            return l >>> r;
+        }
+    }
+
+    private T opRoR(T)(T l, size_t r)
+    {
+        enum maxBits = T.sizeof * 8;
+        if (r >= maxBits)
+            return l;
+        return rotate!("right")(l, cast(T)r);
+    }
+
+    private T opRoL(T)(T l, size_t r)
+    {
+        enum maxBits = T.sizeof * 8;
+        if (r >= maxBits)
+            return l;
+        return rotate!("left")(l, cast(T)r);
     }
 
     private void binaryDispatcher2(string fun, T1=NullType, T2=NullType)(Type t1, Type t2, ubyte* r1, ubyte* r2)
@@ -301,64 +370,81 @@ private final class InterpreterContext
     }
 
     // highlevel D emulation of common ALU instuctions
-    private void emulateALUForType(T, string op, bool binary, string resultType)(ubyte* target, ubyte* lhs, ubyte* rhs)
+    private void emulateALUForType(T, string op, bool binary, string resultType, string rhsType)(ubyte* target, ubyte* lhs, ubyte* rhs)
     {
         static if (binary)
-            enum string code = "*cast(" ~ resultType ~ "*)target = cast(" ~ resultType ~ ")(*cast(T*)lhs " ~ op ~ " *cast(T*)rhs);";
-        else
-            enum string code = "*cast(" ~ resultType ~ "*)target = cast(" ~ resultType ~ ")(" ~ op ~ " *cast(T*)lhs); ";
-
-        static if (__traits(compiles, { mixin(code); }))
         {
-            mixin(code);
+            enum string code0 = "*cast(" ~ resultType ~ "*)target = cast(" ~ resultType ~ ")(*cast(T*)lhs " ~ op ~ " *cast(" ~ rhsType ~ "*)rhs);";
+            enum string code1 = "*cast(" ~ resultType ~ "*)target = cast(" ~ resultType ~ ")" ~ op ~ "(*cast(T*)lhs, *cast(" ~ rhsType ~ "*)rhs);";
+        }
+        else
+        {
+            enum string code0 = "*cast(" ~ resultType ~ "*)target = cast(" ~ resultType ~ ")(" ~ op ~ " *cast(T*)lhs);";
+            enum string code1 = "*cast(" ~ resultType ~ "*)target = cast(" ~ resultType ~ ")" ~ op ~ "(*cast(T*)lhs);)";
+        }
+
+        static if (__traits(compiles, { mixin(code0); }))
+        {
+            mixin(code0);
             return;
         } 
+        else static if (__traits(compiles, { mixin(code1); }))
+        {
+            mixin(code1);
+            return;
+        }
         else
+        {
+            writeln("Neither of");
+            writeln(code0);
+            writeln(code1);
+            writeln("Is known..");
             throw new InterpreterException("Invalid operation: " ~ op ~ " for " ~ T.stringof);
+        }
     }
 
-    private void emulateALU2(string op, bool binary, string resultType="T")(Type lhsType, ubyte* dstMem, ubyte* lhsMem, ubyte* rhsMem)
+    private void emulateALU2(string op, bool binary, string resultType="T", string rhsType="T")(Type lhsType, ubyte* dstMem, ubyte* lhsMem, ubyte* rhsMem)
     {
         if (isType!Int8Type(lhsType))
-            return emulateALUForType!(byte, op, binary, resultType)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(byte, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
 
         if (isType!UInt8Type(lhsType))
-            return emulateALUForType!(ubyte, op, binary, resultType)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(ubyte, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
 
         if (isType!Int16Type(lhsType))
-            return emulateALUForType!(short, op, binary, resultType)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(short, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
 
         if (isType!UInt16Type(lhsType))
-            return emulateALUForType!(ushort, op, binary, resultType)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(ushort, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
 
         if (isType!Int32Type(lhsType))
-            return emulateALUForType!(int, op, binary, resultType)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(int, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
 
         if (isType!UInt32Type(lhsType))
-            return emulateALUForType!(uint, op, binary, resultType)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(uint, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
 
         if (isType!Int64Type(lhsType))
-            return emulateALUForType!(long, op, binary, resultType)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(long, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
 
         if (isType!UInt64Type(lhsType))
-            return emulateALUForType!(ulong, op, binary, resultType)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(ulong, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
 
         if (isType!Float32Type(lhsType))
-            return emulateALUForType!(float, op, binary, resultType)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(float, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
 
         if (isType!Float64Type(lhsType))
-            return emulateALUForType!(double, op, binary, resultType)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(double, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
 
         if (isType!NativeUIntType(lhsType))
-            return emulateALUForType!(size_t, op, binary, resultType)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(size_t, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
 
         if (isType!NativeIntType(lhsType))
-            return emulateALUForType!(isize_t, op, binary, resultType)(dstMem, lhsMem, rhsMem);
+            return emulateALUForType!(isize_t, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
 
         throw new InterpreterException("ALU cannot emulate " ~ op ~ " for " ~ lhsType.name ~ " yet.");
     }
 
-    private void emulateALU(string op, bool binary)(Instruction inst)
+    private void emulateALU(string op, bool binary, string resultType="T", string rhsType="T")(Instruction inst)
     {
         auto lhsType = inst.sourceRegister1.type;
         auto lhsMem = getValue(inst.sourceRegister1);
@@ -366,61 +452,54 @@ private final class InterpreterContext
         auto dstMem = getValue(inst.targetRegister);
 
         static if (binary)
-            rhsMem = cast(ubyte*)getValue(inst.sourceRegister2);
+            rhsMem = getValue(inst.sourceRegister2);
 
-        if (auto vec = cast(VectorType)lhsType)
-        {
-            // all mem locs are pointers
-            dstMem = *cast(ubyte**)dstMem;
-            lhsMem = *cast(ubyte**)lhsMem;
-            static if (binary)
-                rhsMem = *cast(ubyte**)rhsMem;
-
-            auto size = computeSize(vec.elementType, is32Bit);
-            for (auto i = 0; i < vec.elements; i++)
-            {
-                emulateALU2!(op, binary)(vec.elementType, dstMem, lhsMem, rhsMem);
-                dstMem += size;
-                lhsMem += size;
-                rhsMem += size;
-            }
-
-        } 
-        else  
-            emulateALU2!(op, binary)(lhsType, dstMem, lhsMem, rhsMem);  
+        emulateALU2!(op, binary, resultType, rhsType)(lhsType, dstMem, lhsMem, rhsMem);
     }
 
-    private void emulateLogic(string op, bool binary)(Instruction inst)
+    public bool isArrayOrVector(Type type)
     {
-        auto lhsType = inst.sourceRegister1.type;
-        auto lhsMem = getValue(inst.sourceRegister1);
-        ubyte* rhsMem = null;
-        auto dstMem = getValue(inst.targetRegister);
+        if (auto arr = cast(ArrayType)type)
+                return true;
+        if (auto vec = cast(VectorType)type)
+                return true;
+        return false;
+    }
+
+    private void emulateArrayALU(string op, bool binary, string resultType="T", string rhsType="T")(Instruction inst)
+    {
+        uint dstSize;
+        uint lhsSize;
+        auto dstMem = arrayElement(inst.sourceRegister1, 0, dstSize);
+        auto lhsMem = arrayElement(inst.sourceRegister2, 0, lhsSize);
+        uint rhsSize = 0;
+        ubyte* rhsMem;
+        auto num0 = arrayElements(inst.sourceRegister1);
+        auto num1 = arrayElements(inst.sourceRegister2);
+        auto typ = getElementType(inst.sourceRegister2.type);
+        auto numElements = num0 < num1 ? num0 : num1;
 
         static if (binary)
-            rhsMem = cast(ubyte*)getValue(inst.sourceRegister2);
-
-        if (auto vec = cast(VectorType)lhsType)
         {
-            // all mem locs are pointers
-            dstMem = *cast(ubyte**)dstMem;
-            lhsMem = *cast(ubyte**)lhsMem;
-            rhsMem = *cast(ubyte**)rhsMem;
-
-            auto size = computeSize(vec.elementType, is32Bit);
-            for (auto i = 0; i < vec.elements; i++)
+            if (isArrayOrVector(inst.sourceRegister3.type))
             {
-                emulateALU2!(op, binary, "size_t")(vec.elementType, dstMem, lhsMem, rhsMem);
-                dstMem += size_t.sizeof;
-                lhsMem += size;
-                rhsMem += size;
+                auto num2 = arrayElements(inst.sourceRegister3);
+                if (num2 < numElements)
+                    numElements = num2;
+                rhsMem = arrayElement(inst.sourceRegister3, 0, rhsSize);
             }
+            else
+                rhsMem = getValue(inst.sourceRegister3);
+        }
 
-        } 
-        else  
-            emulateALU2!(op, binary, "size_t")(lhsType, dstMem, lhsMem, rhsMem);  
+        for (auto i = 0; i < numElements; i++)
+        {
+            emulateALU2!(op, binary, resultType, rhsType)(typ, dstMem, lhsMem, rhsMem);
+            dstMem += dstSize;
+            lhsMem += lhsSize;
+            rhsMem += rhsSize;
+        }
     }
-
 
     private ubyte*[] collectArgs()
     {
@@ -929,11 +1008,79 @@ private final class InterpreterContext
                 break;
 
             case OperationCode.shL:
-                emulateALU!("<<", true)(inst);
+                emulateALU!("opShL", true, "T", "size_t")(inst);
                 break;
 
             case OperationCode.shR:
-                emulateALU!(">>", true)(inst);
+                emulateALU!("opShR", true, "T", "size_t")(inst);
+                break;
+
+            case OperationCode.roL:
+                emulateALU!("opRoL", true, "T", "size_t")(inst);
+                break;
+
+            case OperationCode.roR:
+                emulateALU!("opRoR", true, "T", "size_t")(inst);
+                break;
+
+            case OperationCode.arrayAriAdd:
+                emulateArrayALU!("+", true)(inst);
+                break;
+
+            case OperationCode.arrayAriSub:
+                emulateArrayALU!("-", true)(inst);
+                break;
+
+            case OperationCode.arrayAriMul:
+                emulateArrayALU!("*", true)(inst);
+                break;
+
+            case OperationCode.arrayAriDiv:
+                emulateArrayALU!("/", true)(inst);
+                break;
+
+            case OperationCode.arrayAriRem:
+                emulateArrayALU!("%", true)(inst);
+                break;
+
+            case OperationCode.arrayAriNeg:
+                emulateArrayALU!("-", false)(inst);
+                break;
+
+            case OperationCode.arrayBitAnd:
+                emulateArrayALU!("&", true)(inst);
+                break;
+
+            case OperationCode.arrayBitOr:
+                emulateArrayALU!("|", true)(inst);
+                break;
+
+            case OperationCode.arrayBitXOr:
+                emulateArrayALU!("^", true)(inst);
+                break;
+
+            case OperationCode.arrayBitNeg:
+                emulateArrayALU!("~", false)(inst);
+                break;
+
+            case OperationCode.arrayNot:
+                emulateArrayALU!("!", false)(inst);
+                break;
+
+            case OperationCode.arrayShL:
+                emulateArrayALU!("opShL", true, "T", "size_t")(inst);
+                break;
+
+            case OperationCode.arrayShR:
+                emulateArrayALU!("opShR", true, "T", "size_t")(inst);
+                break;
+
+            case OperationCode.arrayRoL:
+                emulateArrayALU!("opRoL", true, "T", "size_t")(inst);
+                break;
+
+            case OperationCode.arrayRoR:
+                emulateArrayALU!("opRoR", true, "T", "size_t")(inst);
                 break;
 
             case OperationCode.return_:
@@ -1068,27 +1215,51 @@ private final class InterpreterContext
                 break;
 
             case OperationCode.cmpEq:
-                emulateLogic!("==", true)(inst);
+                emulateALU!("==", true, "size_t")(inst);
                 break;
 
             case OperationCode.cmpNEq:
-                emulateLogic!("!=", true)(inst);
+                emulateALU!("!=", true, "size_t")(inst);
                 break;
 
             case OperationCode.cmpGT:
-                emulateLogic!(">", true)(inst);
+                emulateALU!(">", true, "size_t")(inst);
                 break;
 
             case OperationCode.cmpLT:
-                emulateLogic!("<", true)(inst);
+                emulateALU!("<", true, "size_t")(inst);
                 break;
 
             case OperationCode.cmpGTEq:
-                emulateLogic!(">=", true)(inst);
+                emulateALU!(">=", true, "size_t")(inst);
                 break;
 
             case OperationCode.cmpLTEq:
-                emulateLogic!("<=", true)(inst);
+                emulateALU!("<=", true, "size_t")(inst);
+                break;
+
+            case OperationCode.arrayCmpEq:
+                emulateArrayALU!("==", true, "size_t")(inst);
+                break;
+
+            case OperationCode.arrayCmpNEq:
+                emulateArrayALU!("!=", true, "size_t")(inst);
+                break;
+
+            case OperationCode.arrayCmpGT:
+                emulateArrayALU!(">", true, "size_t")(inst);
+                break;
+
+            case OperationCode.arrayCmpLT:
+                emulateArrayALU!("<", true, "size_t")(inst);
+                break;
+
+            case OperationCode.arrayCmpGTEq:
+                emulateArrayALU!(">=", true, "size_t")(inst);
+                break;
+
+            case OperationCode.arrayCmpLTEq:
+                emulateArrayALU!("<=", true, "size_t")(inst);
                 break;
 
             case OperationCode.ffi:
@@ -1113,7 +1284,6 @@ private final class InterpreterContext
             //default:
             //    throw new InterpreterException("Unsupported opcode: " ~ inst.opCode.name);
         }
-        
         //GC.collect();
     }
 }
