@@ -75,7 +75,7 @@ private final class ExceptionRecord
         data = cast(ubyte*)_calloc(1, nativeIntSize);
         _gc.addRoot(data);
 
-        *cast(RuntimeObject*)data = *cast(RuntimeObject*)ctx.getValue(exception);
+        *cast(RuntimeObject**)data = *cast(RuntimeObject**)ctx.getValue(exception);
     }
 
     public void printStackTrace()
@@ -162,7 +162,7 @@ private final class InterpreterContext
     public ubyte* arrayElement(Register arrayReg, size_t index, out uint size)
     {
         auto typ = arrayReg.type;
-        auto arrayRto = *cast(RuntimeObject*)getValue(arrayReg);
+        auto arrayRto = *cast(RuntimeObject**)getValue(arrayReg);
         auto array = arrayRto.data;
 
         if (auto vec = cast(VectorType)typ)
@@ -179,7 +179,7 @@ private final class InterpreterContext
     // dereferences the first element of an array or vector
     public ubyte* arrayElementFirst(Register arrayReg)
     {
-        auto arrayRto = *cast(RuntimeObject*)getValue(arrayReg);
+        auto arrayRto = *cast(RuntimeObject**)getValue(arrayReg);
         auto array = arrayRto.data;
 
         if (auto arr = cast(ArrayType)arrayReg.type)
@@ -211,7 +211,7 @@ private final class InterpreterContext
         }
         else
         {
-            auto arrayRto = *cast(RuntimeObject*)getValue(arrayReg);
+            auto arrayRto = *cast(RuntimeObject**)getValue(arrayReg);
             return *cast(size_t*)arrayRto.data;
         }
     }
@@ -228,7 +228,7 @@ private final class InterpreterContext
         if (isType!PointerType(typ))
             mem = *cast(ubyte**)mem;
         else if (isType!ReferenceType(typ))
-            mem = (*cast(RuntimeObject*)mem).data;
+            mem = (*cast(RuntimeObject**)mem).data;
 
         return mem + offset;
     }
@@ -355,7 +355,7 @@ private final class InterpreterContext
                 return binaryDispatcher2!(fun, T2, ubyte*)(t2, null, r1, r2);
 
             if (isType!ReferenceType(t1))
-                return binaryDispatcher2!(fun, T2, RuntimeObject*)(t2, null, r1, r2);
+                return binaryDispatcher2!(fun, T2, RuntimeObject**)(t2, null, r1, r2);
 
             if (isType!FunctionPointerType(t1))
                 return binaryDispatcher2!(fun, T2, ubyte*)(t2, null, r1, r2);
@@ -656,8 +656,8 @@ private final class InterpreterContext
         {
             auto dstVec = cast(VectorType)(dstType);
 
-            auto srcRto = *cast(RuntimeObject*)srcMem;
-            auto dstRto = *cast(RuntimeObject*)dstMem;
+            auto srcRto = *cast(RuntimeObject**)srcMem;
+            auto dstRto = *cast(RuntimeObject**)dstMem;
 
             auto dstSize = computeSize(dstVec.elementType, is32Bit);
             auto srcSize = computeSize(srcVec.elementType, is32Bit);
@@ -887,7 +887,7 @@ private final class InterpreterContext
 
                 break;
 
-            case OperationCode.fieldGGet:
+            case OperationCode.fieldStaticGet:
                 auto field = *inst.operand.peek!Field();
                 auto dest = getValue(inst.targetRegister);
                 auto source = _interpreter.getGlobal(field);
@@ -895,7 +895,7 @@ private final class InterpreterContext
                 memcpy(dest, source, size);
                 break;
 
-            case OperationCode.fieldGSet:
+            case OperationCode.fieldStaticSet:
                 auto field = *inst.operand.peek!Field();
                 auto source = getValue(inst.sourceRegister1);
                 auto dest = _interpreter.getGlobal(field);
@@ -903,7 +903,7 @@ private final class InterpreterContext
                 memcpy(dest, source, size);
                 break;
 
-            case OperationCode.fieldGAddr:
+            case OperationCode.fieldStaticAddr:
                 auto field = *inst.operand.peek!Field();
                 auto dest = getValue(inst.targetRegister);
                 auto source = _interpreter.getGlobal(field);
@@ -1150,7 +1150,7 @@ private final class InterpreterContext
                         *cast(size_t*)dst = vec.elements;
                         break;
                     }
-                    auto array = (*cast(RuntimeObject*)getValue(inst.sourceRegister1)).data;
+                    auto array = (*cast(RuntimeObject**)getValue(inst.sourceRegister1)).data;
                     *cast(size_t*)dst = *cast(size_t*)array;
                     break;
                 }
@@ -1178,7 +1178,7 @@ private final class InterpreterContext
                 break;
 
             case OperationCode.memPin:
-                auto rto = *cast(RuntimeObject*)getValue(inst.sourceRegister1);
+                auto rto = *cast(RuntimeObject**)getValue(inst.sourceRegister1);
                 auto handle = _interpreter._gc.pin(rto);
                 *cast(size_t*)getValue(inst.targetRegister) = handle;
                 break;
@@ -1278,7 +1278,7 @@ private final class InterpreterContext
                 break;
 
             case OperationCode.ehCatch:
-                *cast(RuntimeObject*)getValue(inst.targetRegister) = *cast(RuntimeObject*)currentException.data;
+                *cast(RuntimeObject**)getValue(inst.targetRegister) = *cast(RuntimeObject**)currentException.data;
                 break;
 
             //default:
@@ -1589,14 +1589,14 @@ public final class Interpreter
         return closure;
     }
 
-    public RuntimeObject gcallocate(Type t, size_t additionalSize)
+    public RuntimeObject* gcallocate(Type t, size_t additionalSize)
     {
         auto typeInfo = getTypeInfo(t, is32Bit);
         auto r = _gc.allocate(typeInfo, additionalSize);
         return r;
     }
 
-    public void gcfree(RuntimeObject r)
+    public void gcfree(RuntimeObject* r)
     {
         _gc.free(r);
     }
