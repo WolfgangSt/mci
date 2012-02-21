@@ -18,6 +18,7 @@ import core.stdc.string,
        mci.interpreter.allocator,
        mci.interpreter.exception,
        mci.core.code.instructions,
+       mci.vm.intrinsics.context,
        mci.vm.intrinsics.declarations,
        mci.vm.memory.base,
        mci.vm.memory.entrypoint,
@@ -104,16 +105,6 @@ private final class InterpreterContext
     private int _numPushs;
     private Interpreter _interpreter;
     private ExceptionHandler _toplevelHandler;
-
-    // TODO: use utilities:getSignature
-    public ReadOnlyIndexable!Type HACK_paramToTypeList(ReadOnlyIndexable!Parameter params)
-    {
-        NoNullList!Type res = new NoNullList!Type();
-        foreach (p; params)
-            res.add(p.type);
-
-        return res;
-    }
 
     public void gotoBlock(BasicBlock b)
     {
@@ -528,18 +519,31 @@ private final class InterpreterContext
 
         auto fptr = intrinsicFunctions[intrinsic];
 
-        dispatchFFI(HACK_paramToTypeList(intrinsic.parameters), intrinsic.returnType, CallingConvention.cdecl, fptr, dst, args); 
+        dispatchFFI!true(intrinsic.parameters, intrinsic.returnType, CallingConvention.cdecl, fptr, dst, args); 
 
         releaseLocals();
         switchToContext(callCtx);
     }
 
-    private void dispatchFFI(ReadOnlyIndexable!Type paramTypes, Type _returnType, CallingConvention convention, 
+    private void doIndirectIntrinsic(Instruction inst)
+    {
+        auto ffiSig = cast(FunctionPointerType)inst.sourceRegister1.type;
+        auto intrinsic = *cast(Function*)getValue(inst.sourceRegister1);
+        auto fptr = intrinsicFunctions[intrinsic];
+
+        ubyte* dst = null;
+        if (inst.targetRegister)
+            dst = getValue(inst.targetRegister);
+
+        dispatchFFI!true(ffiSig.parameterTypes, ffiSig.returnType, ffiSig.callingConvention, fptr, dst, args);
+    }
+
+    private void dispatchFFI(bool isIntrinsic, T)(ReadOnlyIndexable!T paramTypes, Type _returnType, CallingConvention convention, 
                              FFIFunction entry, ubyte* returnMem, ubyte*[] args)
     {
         try
         {
-           _interpreter.dispatchFFI(paramTypes, _returnType, convention, entry, returnMem, args);
+           _interpreter.dispatchFFI!isIntrinsic(paramTypes, _returnType, convention, entry, returnMem, args);
         } 
         catch (UnwindException)
         {
@@ -574,7 +578,7 @@ private final class InterpreterContext
             dst = callCtx.getValue(callInst.targetRegister);
         }
 
-        dispatchFFI(HACK_paramToTypeList(ip.fun.parameters), ip.fun.returnType, ip.fun.callingConvention, fptr, dst, args);
+        dispatchFFI!false(ip.fun.parameters, ip.fun.returnType, ip.fun.callingConvention, fptr, dst, args);
 
         releaseLocals();
         switchToContext(callCtx);
@@ -589,7 +593,7 @@ private final class InterpreterContext
         if (inst.targetRegister)
             dst = getValue(inst.targetRegister);
 
-        dispatchFFI(ffiSig.parameterTypes, ffiSig.returnType, ffiSig.callingConvention, fptr, dst, args);
+        dispatchFFI!false(ffiSig.parameterTypes, ffiSig.returnType, ffiSig.callingConvention, fptr, dst, args);
 
         throw new InterpreterException("Foreign Function Interfacing not supported yet");
     }
@@ -911,6 +915,23 @@ private final class InterpreterContext
                 *cast(ubyte**)dest = source;
                 break;
 
+            case OperationCode.fieldUserGet:
+                auto rto = *cast(RuntimeObject**)getValue(inst.sourceRegister1);
+                auto dest = getValue(inst.targetRegister);
+                *cast(size_t*)dest = rto.userData;
+                break;
+
+            case OperationCode.fieldUserSet:
+                auto rto = *cast(RuntimeObject**)getValue(inst.sourceRegister1);
+                auto source = getValue(inst.sourceRegister2);
+                rto.userData = *cast(size_t*)source;
+                break;
+
+            case OperationCode.fieldUserAddr:
+                auto rto = *cast(RuntimeObject**)getValue(inst.sourceRegister1);
+                auto dest = getValue(inst.targetRegister);
+                *cast(ubyte**)dest = cast(ubyte*)&rto.userData;
+                break;
 
             case OperationCode.argPush:
                 _numPushs++;
@@ -953,6 +974,8 @@ private final class InterpreterContext
                     subContext.args = collectArgs();
                     switchToContext(subContext);
                 } 
+                else if (auto target = toFunction(funPtr))
+                    doIndirectIntrinsic(inst);
                 else
                     doIndirectFFI(inst);
                 break;
@@ -1396,6 +1419,26 @@ private FFIInterface toFFIConvention(CallingConvention cc)
     }
 }
 
+private Function toFunction(ubyte* mem)
+{
+    // auto fun = cast(Function)(*cast(ubyte**)mem);
+    // Unfortunatley D wont validate the above cast. 
+    // We have to do this by ourself here by walking over all currently loaded functions.
+    // At the moment we just assume it always is a Function.
+    // This wont allow code passing native funcpointers around for the moment.
+    //
+    // Solution: use the XRefVisitor to collect all funcs during startup and check fun against them
+
+    // This heuristic should work always in practise.
+    // All Function objects are GC tracked and thus GC.addrOf() should return non null for any.
+    // A pointer to a native entrypoint on the other hand points to code, which address
+    // does not belong to any managed code. Thus addrOf returns null.
+    // This heuristic is likeley more economic than tracking all Functions as suggested above.
+
+    auto fun = *cast(ubyte**)mem;
+    return GC.addrOf(fun) ? cast(Function)fun : null;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // per thread data
 
@@ -1442,7 +1485,8 @@ public final class Interpreter
     private GarbageCollector _gc;
     private Dictionary!(Function, FFIClosure, false) _closureCache;
     private Dictionary!(Field, ubyte*, false) _globals;
-    private StackAllocator _stackAlloc;    
+    private StackAllocator _stackAlloc;
+    private VirtualMachineContext _vmContext;
 
     public this(GarbageCollector collector)
     {
@@ -1450,6 +1494,7 @@ public final class Interpreter
         _closureCache = new Dictionary!(Function, FFIClosure, false);
         _globals = new Dictionary!(Field, ubyte*, false);
         _stackAlloc = new StackAllocator(_gc);
+        _vmContext = new VirtualMachineContext(collector);
     }
 
     public InterpreterResult interpret(Module mod)
@@ -1520,6 +1565,14 @@ public final class Interpreter
 
     private void runFunction(Function function_, ubyte* returnMem, ubyte** argMem, ExceptionHandler eh)
     {
+        if (function_.attributes == FunctionAttributes.intrinsic)
+        {
+            auto fptr = intrinsicFunctions[function_];
+            dispatchFFI!true(function_.parameters, function_.returnType, CallingConvention.cdecl, fptr, returnMem, argMem); 
+            return;
+        }
+
+
         auto context = new InterpreterContext(function_, this, true, eh);
 
         context.args = serializeArgs(function_.parameters, argMem);
@@ -1578,7 +1631,7 @@ public final class Interpreter
                 registerThreadCleanup(&cleanupThread);
             }
             _gc.attach();
-          
+     
             runFunction(function_, cast(ubyte*)ret, cast(ubyte**)args, eh);
         };
 
@@ -1601,26 +1654,6 @@ public final class Interpreter
         _gc.free(r);
     }
 
-    private Function toFunction(ubyte* mem)
-    {
-        // auto fun = cast(Function)(*cast(ubyte**)mem);
-        // Unfortunatley D wont validate the above cast. 
-        // We have to do this by ourself here by walking over all currently loaded functions.
-        // At the moment we just assume it always is a Function.
-        // This wont allow code passing native funcpointers around for the moment.
-        //
-        // Solution: use the XRefVisitor to collect all funcs during startup and check fun against them
-
-        // This heuristic should work always in practise.
-        // All Function objects are GC tracked and thus GC.addrOf() should return non null for any.
-        // A pointer to a native entrypoint on the other hand points to code, which address
-        // does not belong to any managed code. Thus addrOf returns null.
-        // This heuristic is likeley more economic than tracking all Functions as suggested above.
-
-        auto fun = *cast(ubyte**)mem;
-        return GC.addrOf(fun) ? cast(Function)fun : null;
-    }
-
     private ubyte* getParamMem(ubyte* mem, Type t)
     {
         if (auto fptr = cast(FunctionPointerType)t)
@@ -1636,18 +1669,37 @@ public final class Interpreter
         return mem;
     }
 
-    public void dispatchFFI(ReadOnlyIndexable!Type paramTypes, Type _returnType, CallingConvention convention, 
-                            FFIFunction entry, ubyte* returnMem, ubyte*[] args)
+    public void dispatchFFI(bool isIntrinsic, T, U)(ReadOnlyIndexable!T paramTypes, Type _returnType, CallingConvention convention, 
+                            FFIFunction entry, ubyte* returnMem, U args)
     {
+        auto argCount = paramTypes.count;
+        static if (isIntrinsic)
+            argCount++;
+
         auto returnType = toFFIType(_returnType);
-        auto argTypes = new FFIType*[paramTypes.count];
-        auto argMem = new void*[paramTypes.count];
+        auto argTypes = new FFIType*[argCount];
+        auto argMem = new void*[argCount];
         auto cconv = toFFIConvention(convention);
 
         foreach (idx, p; paramTypes)
         {
-            argTypes[idx] = toFFIType(p);
-            argMem[idx] = getParamMem(args[idx], p);
+            static if (is(T == Parameter)) 
+                auto t = p.type;
+            else 
+                auto t = p;
+
+            auto i = idx;
+            static if (isIntrinsic)
+                i++;
+
+            argTypes[i] = toFFIType(t);
+            argMem[i] = getParamMem(args[i], t);
+        }
+
+        static if (isIntrinsic)
+        {
+            argTypes[0] = FFIType.ffiPointer;
+            argMem[0] = cast(ubyte*)&_vmContext;
         }
 
         ffiCall(entry, returnType, argTypes, returnMem, argMem, cconv); 
