@@ -100,8 +100,9 @@ private final class InterpreterContext
     public InterpreterContext returnContext;
     public ubyte* returnMem;
     public ubyte*[] args;
-    public int _argIndex;
+    private int _argIndex;
     private Dictionary!(Register, ubyte*, false) _registerState;
+    private Dictionary!(Register, ubyte*, false) _shadowState;
     private int _numPushs;
     private Interpreter _interpreter;
     private ExceptionHandler _toplevelHandler;
@@ -124,6 +125,15 @@ private final class InterpreterContext
 
     public void releaseLocals()
     {
+        if (_shadowState !is null)
+        {
+            foreach (r; _shadowState)
+            {
+                auto typ = r.x.type;
+                _interpreter._stackAlloc.free(typ);
+            }
+        }
+
         foreach (r; _registerState)
         {
             auto typ = r.x.type;
@@ -137,16 +147,37 @@ private final class InterpreterContext
         _toplevelHandler = eh;
         ip.fun = f;
 
+        allocateLocals();
+
+        if (jumpToEntry)
+            gotoEntry();
+    }
+
+    private void allocateLocals()
+    {
         _registerState = new Dictionary!(Register, ubyte*, false)();
-        foreach (namereg; f.registers)
+        foreach (namereg; ip.fun.registers)
         {
             auto reg = namereg.y;
             auto mem = _interpreter._stackAlloc.allocate(reg.type);
             _registerState.add(reg, mem);
         }
+    }
 
-        if (jumpToEntry)
-            gotoEntry();
+    // required for tail calls
+    private void shadowLocals()
+    {
+        auto oldShadow = _shadowState;
+        _shadowState = _registerState;
+
+        if (oldShadow is null)
+            allocateLocals();
+        else
+        {
+            _registerState = oldShadow;
+            foreach (r; _registerState)
+                memset(r.y, 0, computeSize(r.x.type, is32Bit));
+        }
     }
 
     // dereferences an array or vector element
@@ -983,6 +1014,7 @@ private final class InterpreterContext
             case OperationCode.callTail:
             case OperationCode.invokeTail:
                 args = collectArgs();
+                shadowLocals();
                 gotoEntry();
                 break;           
 
