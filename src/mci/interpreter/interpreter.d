@@ -45,7 +45,8 @@ static if (isPosix)
     import std.c.linux.linux; 
 }
 
-final class InterpreterResult
+// TODO: InterpreterResult must be gc rooted
+public final class InterpreterResult
 {
     Type resultType;
     ubyte[] result;
@@ -1520,19 +1521,24 @@ public final class Interpreter
     private StackAllocator _stackAlloc;
     private VirtualMachineContext _vmContext;
 
-    public this(GarbageCollector collector)
+    public this(GarbageCollector gc)
+    in
     {
-        _gc = collector;
+        assert(gc);
+    }
+    body
+    {
+        _gc = gc;
         _closureCache = new Dictionary!(Function, FFIClosure, false);
         _globals = new Dictionary!(Field, ubyte*, false);
         _stackAlloc = new StackAllocator(_gc);
-        _vmContext = new VirtualMachineContext(collector);
+        _vmContext = new VirtualMachineContext(gc);
     }
 
-    public InterpreterResult interpret(Module mod)
+    public InterpreterResult interpret(Module module_)
     in
     {
-        assert(mod);
+        assert(module_);
     }
     out (result)
     {
@@ -1541,12 +1547,12 @@ public final class Interpreter
     body
     {
         {
-            auto main = mod.functions["main"];
+            auto main = module_.functions["main"];
             return runFunction(main);
         }
     }
 
-    ubyte* getGlobal(Field f)
+    private ubyte* getGlobal(Field f)
     {
         if (f.storage == FieldStorage.thread)
         {
@@ -1674,14 +1680,14 @@ public final class Interpreter
         return closure;
     }
 
-    public RuntimeObject* gcallocate(Type t, size_t additionalSize)
+    private RuntimeObject* gcallocate(Type t, size_t additionalSize)
     {
         auto typeInfo = getTypeInfo(t, is32Bit);
         auto r = _gc.allocate(typeInfo, additionalSize);
         return r;
     }
 
-    public void gcfree(RuntimeObject* r)
+    private void gcfree(RuntimeObject* r)
     {
         _gc.free(r);
     }
@@ -1701,7 +1707,7 @@ public final class Interpreter
         return mem;
     }
 
-    public void dispatchFFI(bool isIntrinsic, T, U)(ReadOnlyIndexable!T paramTypes, Type _returnType, CallingConvention convention, 
+    private void dispatchFFI(bool isIntrinsic, T, U)(ReadOnlyIndexable!T paramTypes, Type _returnType, CallingConvention convention, 
                             FFIFunction entry, ubyte* returnMem, U args)
     {
         auto argCount = paramTypes.count;
@@ -1737,25 +1743,34 @@ public final class Interpreter
         ffiCall(entry, returnType, argTypes, returnMem, argMem, cconv); 
     }
 
-    // TODO: cleanup double allocs once stuff works again
-    InterpreterResult runFunction(Function fun)
+    public InterpreterResult runFunction(Function function_)
+    in
     {
-        auto context = new InterpreterContext(fun, this, true, &defaultExceptionHandler);
-        auto returnType = fun.returnType;
-        if (returnType)
-            context.returnMem = cast(ubyte*)_calloc(1, computeSize(returnType, is32Bit));
-        switchToContext(context);
-        run();
-
+        assert(function_);
+    }
+    out (result)
+    {
+        assert(result);
+    }
+    body
+    {
+        auto context = new InterpreterContext(function_, this, true, &defaultExceptionHandler);
+        auto returnType = function_.returnType;
         auto result = new InterpreterResult();
-        result.resultType = returnType;
+
         if (returnType)
         {
             auto resultSize = computeSize(returnType, is32Bit);
             result.result = new ubyte[resultSize];
-            memcpy(result.result.ptr, context.returnMem, resultSize);
-            _free(context.returnMem);
+            context.returnMem = result.result.ptr;
+        }
 
+        switchToContext(context);
+        run();
+
+        result.resultType = returnType;
+        if (returnType)
+        {
             writeln("The program quitted with:");
             writeln( prettyPrint( result.resultType, is32Bit, result.result.ptr, "(return value)" ) );
         } 
