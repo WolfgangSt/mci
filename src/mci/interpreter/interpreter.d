@@ -18,6 +18,7 @@ import core.stdc.string,
        mci.interpreter.allocator,
        mci.interpreter.exception,
        mci.core.code.instructions,
+       mci.vm.execution,
        mci.vm.intrinsics.context,
        mci.vm.intrinsics.declarations,
        mci.vm.memory.base,
@@ -43,13 +44,6 @@ alias void delegate() ExceptionHandler;
 static if (isPosix)
 {
     import std.c.linux.linux; 
-}
-
-// TODO: InterpreterResult must be gc rooted
-public final class InterpreterResult
-{
-    Type resultType;
-    ubyte[] result;
 }
 
 private struct InstructionPointer
@@ -1513,7 +1507,7 @@ private void switchToContext(InterpreterContext context)
 ////////////////////////////////////////////////////////////////////////////////
 // interpreter helper
 
-public final class Interpreter
+public final class Interpreter : ExecutionEngine
 {
     private GarbageCollector _gc;
     private Dictionary!(Function, FFIClosure, false) _closureCache;
@@ -1535,21 +1529,65 @@ public final class Interpreter
         _vmContext = new VirtualMachineContext(gc);
     }
 
-    public InterpreterResult interpret(Module module_)
-    in
-    {
-        assert(module_);
-    }
+    @property public GarbageCollector gc()
     out (result)
     {
         assert(result);
     }
     body
     {
+        return _gc;
+    }
+
+    @property public VirtualMachineContext context()
+    out (result)
+    {
+        assert(result);
+    }
+    body
+    {
+        return _vmContext;
+    }
+
+    public RuntimeValue execute(Function function_, NoNullList!RuntimeValue arguments)
+    in
+    {
+        assert(function_);
+        assert(arguments);
+        assert(arguments.count == function_.parameters.count);
+
+        foreach (i, arg; arguments)
+            assert(arg is function_.parameters[i].type);
+    }
+    out (result)
+    {
+        assert(function_.returnType ? !!result : !result);
+    }
+    body
+    {
+        auto context = new InterpreterContext(function_, this, true, &defaultExceptionHandler);
+        auto returnType = function_.returnType;
+        RuntimeValue result;
+
+        if (returnType)
         {
-            auto main = module_.functions["main"];
-            return runFunction(main);
+            result = new RuntimeValue(_gc, returnType);
+            context.returnMem = result.data;
         }
+
+        auto numArgs = arguments.count;
+        if (numArgs > 0)
+        {
+            auto args = new ubyte*[numArgs];
+            foreach (i, arg; arguments)
+                args[i] = arg.data;
+            context.args = args;
+        }
+
+        switchToContext(context);
+        run();
+
+        return result;
     }
 
     private ubyte* getGlobal(Field f)
@@ -1741,42 +1779,5 @@ public final class Interpreter
         }
 
         ffiCall(entry, returnType, argTypes, returnMem, argMem, cconv); 
-    }
-
-    public InterpreterResult runFunction(Function function_)
-    in
-    {
-        assert(function_);
-    }
-    out (result)
-    {
-        assert(result);
-    }
-    body
-    {
-        auto context = new InterpreterContext(function_, this, true, &defaultExceptionHandler);
-        auto returnType = function_.returnType;
-        auto result = new InterpreterResult();
-
-        if (returnType)
-        {
-            auto resultSize = computeSize(returnType, is32Bit);
-            result.result = new ubyte[resultSize];
-            context.returnMem = result.result.ptr;
-        }
-
-        switchToContext(context);
-        run();
-
-        result.resultType = returnType;
-        if (returnType)
-        {
-            writeln("The program quitted with:");
-            writeln( prettyPrint( result.resultType, is32Bit, result.result.ptr, "(return value)" ) );
-        } 
-        else
-            writeln("The program quitted without return value.");
-        
-        return result;
     }
 }

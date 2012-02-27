@@ -2,6 +2,7 @@ module mci.cli.tools.assembler;
 
 import std.getopt,
        std.path,
+       std.stdio,
        std.utf,
        mci.assembler.disassembly.ast,
        mci.assembler.exception,
@@ -10,13 +11,16 @@ import std.getopt,
        mci.assembler.parsing.exception,
        mci.assembler.parsing.lexer,
        mci.assembler.parsing.parser,
+       mci.core.config,
        mci.core.container,
        mci.core.exception,
        mci.core.io,
        mci.core.code.functions,
        mci.core.code.modules,
+       mci.vm.execution,
        mci.vm.intrinsics.declarations,
        mci.vm.io.writer,
+       mci.vm.memory.prettyprint,
        mci.cli.main,
        mci.cli.tool,
        mci.cli.tools.interpreter,
@@ -197,8 +201,19 @@ public final class AssemblerTool : Tool
             auto writer = new ModuleWriter();
             if (interpret)
             {
-                auto interpreter = new Interpreter(new DGarbageCollector());
-                interpreter.interpret(mod);
+                ExecutionEngine interpreter = new Interpreter(new DGarbageCollector());
+                auto main = mod.functions["main"];
+                auto params = new NoNullList!RuntimeValue();
+                auto result = interpreter.execute(main, params);
+
+                if (result !is null)
+                {
+                    writeln("The program quitted with:");
+                    writeln( prettyPrint( result.type, is32Bit, result.data, "(return value)" ) );
+                }
+                else
+                    writeln("The program quitted without return value.");
+
                 return true;
             }
             (new ModuleWriter()).save(mod, output);
