@@ -27,6 +27,7 @@ private size_t doAlign(size_t value)
 private final class StackAllocatorBlock
 {
     private size_t _size;
+    private size_t _sizeInWords;
     private size_t _load;
     private ubyte* _mem;
     private StackAllocatorBlock _predecessor;
@@ -51,12 +52,13 @@ private final class StackAllocatorBlock
         _size = sizeInWords * _wordSize;
         _mem = cast(ubyte*)calloc(_size, 1);
         
+        _sizeInWords = sizeInWords;
         _allocator._gc.addRange(_mem, sizeInWords);
     }
 
     private void releaseBlock()
     {
-        _allocator._gc.removeRange(_mem);
+        _allocator._gc.removeRange(_mem, _sizeInWords);
         .free(_mem);
         _size = 0;
         _load = 0;
