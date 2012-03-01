@@ -669,7 +669,7 @@ private final class InterpreterContext
             auto dst = cast(ubyte**)getValue(target);
             auto elementType = typ.elementType;
             auto elementSize = computeSize(elementType, is32Bit);
-            auto mem = _interpreter.gcallocate(typ, count * elementSize);       
+            auto mem = _interpreter.gcallocate(typ, 0);
             *dst = cast(ubyte*)mem;
 
             return;
