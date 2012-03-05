@@ -46,6 +46,11 @@ static if (isPosix)
     import std.c.linux.linux; 
 }
 
+static if (architecture == Architecture.x86)
+{
+    import core.cpuid;
+}
+
 private struct InstructionPointer
 {
     public Function fun;
@@ -176,7 +181,7 @@ private final class InterpreterContext
     }
 
     // dereferences an array or vector element
-    public ubyte* arrayElement(Register arrayReg, size_t index, out uint size)
+    public ubyte* arrayElement(Register arrayReg, size_t index, out size_t size)
     {
         auto typ = arrayReg.type;
         auto arrayRto = *cast(RuntimeObject**)getValue(arrayReg);
@@ -190,7 +195,7 @@ private final class InterpreterContext
             size = computeSize(arr.elementType, is32Bit);
         }
 
-        return array + index * size;
+        return alignArray(array) + index * size;
     }
 
     // dereferences the first element of an array or vector
@@ -202,7 +207,7 @@ private final class InterpreterContext
         if (auto arr = cast(ArrayType)arrayReg.type)
             array += nativeIntSize;
 
-        return array;
+        return alignArray(array);
     }
 
     public ubyte* arrayOrPointerElementFirst(Register reg)
@@ -213,7 +218,7 @@ private final class InterpreterContext
     }
 
     // dereferences an array or vector or pointer element
-    public ubyte* arrayElement(Register arrayReg, Register indexReg, out uint size)
+    public ubyte* arrayElement(Register arrayReg, Register indexReg, out size_t size)
     {
         auto index = *cast(size_t*)getValue(indexReg);
         return arrayElement(arrayReg, index, size);
@@ -234,7 +239,7 @@ private final class InterpreterContext
     }
 
     // (de)references a struct field given a struct pointer or ref
-    public ubyte* structElement(Register structReg, Field field, out uint size)
+    public ubyte* structElement(Register structReg, Field field, out size_t size)
     {
         auto mem = getValue(structReg);
         auto offset = computeOffset(field, is32Bit);
@@ -485,11 +490,11 @@ private final class InterpreterContext
 
     private void emulateArrayALU(string op, bool binary, string resultType="T", string rhsType="T")(Instruction inst)
     {
-        uint dstSize;
-        uint lhsSize;
+        size_t dstSize;
+        size_t lhsSize;
         auto dstMem = arrayElement(inst.sourceRegister1, 0, dstSize);
         auto lhsMem = arrayElement(inst.sourceRegister2, 0, lhsSize);
-        uint rhsSize = 0;
+        size_t rhsSize = 0;
         ubyte* rhsMem;
         auto num0 = arrayElements(inst.sourceRegister1);
         auto num1 = arrayElements(inst.sourceRegister2);
@@ -656,7 +661,7 @@ private final class InterpreterContext
             auto dst = cast(ubyte**)getValue(target);
             auto elementType = typ.elementType;
             auto elementSize = computeSize(elementType, is32Bit);
-            auto mem = _interpreter.gcallocate(typ, count * elementSize);
+            auto mem = _interpreter.gcallocate(typ, count * elementSize + maxPadding);
             *cast(size_t*)mem.data = count;
             *dst = cast(ubyte*)mem;
 
@@ -669,7 +674,7 @@ private final class InterpreterContext
             auto dst = cast(ubyte**)getValue(target);
             auto elementType = typ.elementType;
             auto elementSize = computeSize(elementType, is32Bit);
-            auto mem = _interpreter.gcallocate(typ, 0);
+            auto mem = _interpreter.gcallocate(typ, maxPadding);
             *dst = cast(ubyte*)mem;
 
             return;
@@ -893,7 +898,7 @@ private final class InterpreterContext
                 break;
 
             case OperationCode.fieldGet:
-                uint size;
+                size_t size;
                 auto source = structElement(inst.sourceRegister1, *inst.operand.peek!Field(), size);
                 auto dest = getValue(inst.targetRegister);
                 memcpy(dest, source, size);
@@ -901,7 +906,7 @@ private final class InterpreterContext
                 break;
 
             case OperationCode.fieldSet:
-                uint size;
+                size_t size;
                 auto dest = structElement(inst.sourceRegister1, *inst.operand.peek!Field(), size);
                 auto source = getValue(inst.sourceRegister2);
                 memcpy(dest, source, size);
@@ -909,7 +914,7 @@ private final class InterpreterContext
                 break;
 
             case OperationCode.fieldAddr:
-                uint size;
+                size_t size;
                 auto source = structElement(inst.sourceRegister1, *inst.operand.peek!Field(), size);
                 auto dest = getValue(inst.targetRegister);
 
@@ -1165,7 +1170,7 @@ private final class InterpreterContext
             case OperationCode.arraySet:
                 {
                     auto src   = getValue(inst.sourceRegister3);
-                    uint size;
+                    size_t size;
                     auto dst = arrayElement(inst.sourceRegister1, inst.sourceRegister2, size);
 
                     memcpy(dst, src, size);
@@ -1175,7 +1180,7 @@ private final class InterpreterContext
             case OperationCode.arrayGet:
                 {
                     auto dst = getValue(inst.targetRegister);
-                    uint size;
+                    size_t size;
                     auto src = arrayElement(inst.sourceRegister1, inst.sourceRegister2, size);
 
                     memcpy(dst, src, size);
@@ -1185,7 +1190,7 @@ private final class InterpreterContext
             case OperationCode.arrayAddr:
                 {
                     auto dst = getValue(inst.targetRegister);
-                    uint size;
+                    size_t size;
                     auto src = arrayElement(inst.sourceRegister1, inst.sourceRegister2, size);
 
                     *cast(ubyte**)dst = src;
@@ -1344,6 +1349,9 @@ private final class InterpreterContext
 private __gshared Dictionary!(Type, FFIType*, false) ffiStructTypeCache;
 private __gshared size_t nativeIntSize;
 private __gshared UnwindException unwindException;
+private __gshared size_t maxPadding;
+private __gshared size_t sseAlignment;
+private __gshared size_t sseAlignmentMask;
 
 private class UnwindException : Exception
 {
@@ -1358,6 +1366,32 @@ shared static this()
     ffiStructTypeCache = new Dictionary!(Type, FFIType*, false);
     nativeIntSize = computeSize(NativeUIntType.instance, is32Bit);
     unwindException = new UnwindException();
+
+    static if (architecture == Architecture.x86)
+    {
+        sseAlignment = is32Bit ? 32 : 64;
+        if (mmx)
+            sseAlignment = 64;
+        if (sse)
+            sseAlignment = 128;
+        //if (avx) -- not supported by cpuid.d, yet
+        //    sseAlignment = 256;
+    }
+    else
+        sseAlignment = 256;
+
+    writefln("Gonna align to %s bits", sseAlignment);
+
+    sseAlignment /= 8;
+    sseAlignmentMask = sseAlignment - 1;
+    maxPadding = sseAlignment - is32Bit ? 4 : 8;
+}
+
+ubyte* alignArray(ubyte* mem)
+{
+    size_t i = cast(size_t)mem;
+    i = (i + sseAlignmentMask) & ~sseAlignmentMask;
+    return cast(ubyte*)i;
 }
 
 private FFIType* toFFIType(Type t)
