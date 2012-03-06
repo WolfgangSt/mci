@@ -1224,11 +1224,13 @@ private final class InterpreterContext
                 break;
 
             case OperationCode.memAlloc:
+            case OperationCode.memSAlloc:
                 auto count = *cast(size_t*)getValue(inst.sourceRegister1);
                 allocate(inst.targetRegister, count);
                 break;
 
             case OperationCode.memNew:
+            case OperationCode.memSNew:
                 allocate(inst.targetRegister, 1);
                 break;
 
@@ -1260,7 +1262,10 @@ private final class InterpreterContext
 
             case OperationCode.memFree:
                 auto mem = *cast(ubyte**)getValue(inst.sourceRegister1);
-                _free(mem);
+                if (isType!PointerType(inst.sourceRegister1.type))
+                    _free(mem);
+                else
+                    _interpreter._gc.free(cast(RuntimeObject*)mem);
                 break;
 
             case OperationCode.memAddr:
@@ -1379,8 +1384,6 @@ shared static this()
     }
     else
         sseAlignment = 256;
-
-    writefln("Gonna align to %s bits", sseAlignment);
 
     sseAlignment /= 8;
     sseAlignmentMask = sseAlignment - 1;
