@@ -11,6 +11,7 @@ import std.getopt,
        mci.assembler.parsing.exception,
        mci.assembler.parsing.lexer,
        mci.assembler.parsing.parser,
+       mci.core.common,
        mci.core.config,
        mci.core.container,
        mci.core.exception,
@@ -25,7 +26,14 @@ import std.getopt,
        mci.cli.tool,
        mci.cli.tools.interpreter,
        mci.interpreter.interpreter,
-       mci.vm.memory.dgc;
+       mci.vm.memory.base,
+       mci.vm.memory.dgc,
+       mci.vm.memory.libc;
+
+static if (operatingSystem != OperatingSystem.windows)
+{
+    import mci.vm.memory.boehm;
+}
 
 public enum string inputFileExtension = ".ial";
 
@@ -201,7 +209,23 @@ public final class AssemblerTool : Tool
             auto writer = new ModuleWriter();
             if (interpret)
             {
-                ExecutionEngine interpreter = new Interpreter(new DGarbageCollector());
+                GarbageCollector gc;
+                final switch (gcType)
+                {
+                    case GarbageCollectorType.libc:
+                        gc = new LibCGarbageCollector();
+                        break;
+                    case GarbageCollectorType.dgc:
+                        gc = new DGarbageCollector();
+                        break;
+                    static if (operatingSystem != OperatingSystem.windows)
+                    {
+                        case GarbageCollectorType.boehm:
+                            gc = new BoehmGarbageCollector();
+                            break;
+                    }
+                }
+                ExecutionEngine interpreter = new Interpreter(gc);
                 auto main = mod.functions["main"];
                 auto params = new NoNullList!RuntimeValue();
                 auto result = interpreter.execute(main, params);
