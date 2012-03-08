@@ -247,9 +247,9 @@ private final class InterpreterContext
 
         size = computeSize(field.type, is32Bit); 
 
-        if (isType!PointerType(typ))
+        if (tryCast!PointerType(typ))
             mem = *cast(ubyte**)mem;
-        else if (isType!ReferenceType(typ))
+        else if (tryCast!ReferenceType(typ))
             mem = (*cast(RuntimeObject**)mem).data;
 
         return mem + offset;
@@ -337,53 +337,27 @@ private final class InterpreterContext
     {
         static if(is(T1 == NullType))
         {
-            if (isType!Int8Type(t1))
-                return binaryDispatcher2!(fun, T2, byte)(t2, null, r1, r2);
-
-            if (isType!UInt8Type(t1))
-                return binaryDispatcher2!(fun, T2, ubyte)(t2, null, r1, r2);
-
-            if (isType!Int16Type(t1))
-                return binaryDispatcher2!(fun, T2, short)(t2, null, r1, r2);
-
-            if (isType!UInt16Type(t1))
-                return binaryDispatcher2!(fun, T2, ushort)(t2, null, r1, r2);
-
-            if (isType!Int32Type(t1))
-                return binaryDispatcher2!(fun, T2, int)(t2, null, r1, r2);
-
-            if (isType!UInt32Type(t1))
-                return binaryDispatcher2!(fun, T2, uint)(t2, null, r1, r2);
-
-            if (isType!Int64Type(t1))
-                return binaryDispatcher2!(fun, T2, long)(t2, null, r1, r2);
-
-            if (isType!UInt64Type(t1))
-                return binaryDispatcher2!(fun, T2, ulong)(t2, null, r1, r2);
-
-            if (isType!Float32Type(t1))
-                return binaryDispatcher2!(fun, T2, float)(t2, null, r1, r2);
-
-            if (isType!Float64Type(t1))
-                return binaryDispatcher2!(fun, T2, double)(t2, null, r1, r2);
-
-            if (isType!NativeUIntType(t1))
-                return binaryDispatcher2!(fun, T2, size_t)(t2, null, r1, r2);
-
-            if (isType!NativeIntType(t1))
-                return binaryDispatcher2!(fun, T2, isize_t)(t2, null, r1, r2);
-
-            if (isType!PointerType(t1))
-                return binaryDispatcher2!(fun, T2, ubyte*)(t2, null, r1, r2);
-
-            if (isType!ReferenceType(t1))
-                return binaryDispatcher2!(fun, T2, RuntimeObject**)(t2, null, r1, r2);
-
-            if (isType!FunctionPointerType(t1))
-                return binaryDispatcher2!(fun, T2, ubyte*)(t2, null, r1, r2);
-
-            throw new InterpreterException("Dispatcher cannot deal with " ~ t1.name ~ " yet.");
-        } 
+            match(t1,
+                  (Int8Type t) => binaryDispatcher2!(fun, T2, byte)(t2, null, r1, r2),
+                  (UInt8Type t) => binaryDispatcher2!(fun, T2, ubyte)(t2, null, r1, r2),
+                  (Int16Type t) => binaryDispatcher2!(fun, T2, short)(t2, null, r1, r2),
+                  (UInt16Type t) => binaryDispatcher2!(fun, T2, ushort)(t2, null, r1, r2),
+                  (Int32Type t) => binaryDispatcher2!(fun, T2, int)(t2, null, r1, r2),
+                  (UInt32Type t) => binaryDispatcher2!(fun, T2, uint)(t2, null, r1, r2),
+                  (Int64Type t) => binaryDispatcher2!(fun, T2, long)(t2, null, r1, r2),
+                  (UInt64Type t) => binaryDispatcher2!(fun, T2, ulong)(t2, null, r1, r2),
+                  (Float32Type t) => binaryDispatcher2!(fun, T2, float)(t2, null, r1, r2),
+                  (Float64Type t) => binaryDispatcher2!(fun, T2, double)(t2, null, r1, r2),
+                  (NativeUIntType t) => binaryDispatcher2!(fun, T2, size_t)(t2, null, r1, r2),
+                  (NativeIntType t) => binaryDispatcher2!(fun, T2, isize_t)(t2, null, r1, r2),
+                  (PointerType t) => binaryDispatcher2!(fun, T2, ubyte*)(t2, null, r1, r2),
+                  (ReferenceType t) => binaryDispatcher2!(fun, T2, RuntimeObject**)(t2, null, r1, r2),
+                  (FunctionPointerType t) => binaryDispatcher2!(fun, T2, ubyte*)(t2, null, r1, r2),
+                  ()
+                  {
+                      throw new InterpreterException("Dispatcher cannot deal with " ~ t1.name ~ " yet.");
+                  });
+        }
         else
         {
             enum string code = fun ~ "!(T2, T1)(cast(T2*)r2, cast(T1*)r1);";
@@ -427,43 +401,23 @@ private final class InterpreterContext
 
     private void emulateALU2(string op, bool binary, string resultType="T", string rhsType="T")(Type lhsType, ubyte* dstMem, ubyte* lhsMem, ubyte* rhsMem)
     {
-        if (isType!Int8Type(lhsType))
-            return emulateALUForType!(byte, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
-
-        if (isType!UInt8Type(lhsType))
-            return emulateALUForType!(ubyte, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
-
-        if (isType!Int16Type(lhsType))
-            return emulateALUForType!(short, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
-
-        if (isType!UInt16Type(lhsType))
-            return emulateALUForType!(ushort, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
-
-        if (isType!Int32Type(lhsType))
-            return emulateALUForType!(int, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
-
-        if (isType!UInt32Type(lhsType))
-            return emulateALUForType!(uint, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
-
-        if (isType!Int64Type(lhsType))
-            return emulateALUForType!(long, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
-
-        if (isType!UInt64Type(lhsType))
-            return emulateALUForType!(ulong, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
-
-        if (isType!Float32Type(lhsType))
-            return emulateALUForType!(float, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
-
-        if (isType!Float64Type(lhsType))
-            return emulateALUForType!(double, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
-
-        if (isType!NativeUIntType(lhsType))
-            return emulateALUForType!(size_t, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
-
-        if (isType!NativeIntType(lhsType))
-            return emulateALUForType!(isize_t, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem);
-
-        throw new InterpreterException("ALU cannot emulate " ~ op ~ " for " ~ lhsType.name ~ " yet.");
+        match(lhsType,
+              (Int8Type t) => emulateALUForType!(byte, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem),
+              (UInt8Type t) => emulateALUForType!(ubyte, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem),
+              (Int16Type t) => emulateALUForType!(short, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem),
+              (UInt16Type t) => emulateALUForType!(ushort, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem),
+              (Int32Type t) => emulateALUForType!(int, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem),
+              (UInt32Type t) => emulateALUForType!(uint, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem),
+              (Int64Type t) => emulateALUForType!(long, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem),
+              (UInt64Type t) => emulateALUForType!(ulong, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem),
+              (Float32Type t) => emulateALUForType!(float, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem),
+              (Float64Type t) => emulateALUForType!(double, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem),
+              (NativeUIntType t) => emulateALUForType!(size_t, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem),
+              (NativeIntType t) => emulateALUForType!(isize_t, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem),
+              ()
+              {
+                  throw new InterpreterException("ALU cannot emulate " ~ op ~ " for " ~ lhsType.name ~ " yet.");
+              });
     }
 
     private void emulateALU(string op, bool binary, string resultType="T", string rhsType="T")(Instruction inst)
@@ -1262,7 +1216,7 @@ private final class InterpreterContext
 
             case OperationCode.memFree:
                 auto mem = *cast(ubyte**)getValue(inst.sourceRegister1);
-                if (isType!PointerType(inst.sourceRegister1.type))
+                if (tryCast!PointerType(inst.sourceRegister1.type))
                     _free(mem);
                 else
                     _interpreter._gc.free(cast(RuntimeObject*)mem);
@@ -1397,74 +1351,48 @@ ubyte* alignArray(ubyte* mem)
     return cast(ubyte*)i;
 }
 
-private FFIType* toFFIType(Type t)
+private FFIType* toFFIType(Type type)
 {
-    if (t is null)
-        return FFIType.ffiVoid; // only valid as return type
+    return match(type,
+                 (UInt8Type t) => FFIType.ffiUByte,
+                 (Int8Type t) => FFIType.ffiByte,
+                 (UInt16Type t) => FFIType.ffiUShort,
+                 (Int16Type t) => FFIType.ffiShort,
+                 (UInt32Type t) => FFIType.ffiUInt,
+                 (Int32Type t) => FFIType.ffiInt,
+                 (UInt64Type t) => FFIType.ffiULong,
+                 (Int64Type t) => FFIType.ffiLong,
+                 // replace with FFI native types rather than is32Bit switch here
+                 // as soon they are available
+                 (NativeIntType t) => is32Bit ? FFIType.ffiInt : FFIType.ffiLong,
+                 (NativeUIntType t) => is32Bit ? FFIType.ffiUInt : FFIType.ffiULong,
+                 (Float32Type t) => FFIType.ffiFloat,
+                 (Float64Type t) => FFIType.ffiDouble,
+                 (PointerType t) => FFIType.ffiPointer,
+                 (FunctionPointerType t) => FFIType.ffiPointer,
+                 (StructureType t)
+                 {
+                     synchronized (ffiStructTypeCache)
+                     {
+                         if (auto cache = ffiStructTypeCache.get(t))
+                             return *cache;
 
-    if (isType!UInt8Type(t))
-        return FFIType.ffiUByte;
+                         // build a new ffi type
+                         auto subTypes = new FFIType*[t.fields.count];
+                         foreach (idx, field; t.fields)
+                             subTypes[idx] = toFFIType(field.y.type);
 
-    if (isType!Int8Type(t))
-        return FFIType.ffiByte;
-
-    if (isType!UInt16Type(t))
-        return FFIType.ffiUShort;
-
-    if (isType!Int16Type(t))
-        return FFIType.ffiShort;
-
-    if (isType!UInt32Type(t))
-        return FFIType.ffiUInt;
-
-    if (isType!Int32Type(t))
-        return FFIType.ffiInt;
-
-    if (isType!UInt64Type(t))
-        return FFIType.ffiULong;
-
-    if (isType!Int64Type(t))
-        return FFIType.ffiLong;
-
-    // replace with FFI native types rather than is32Bit switch here
-    // as soon they are available
-    if (isType!NativeIntType(t))
-        return is32Bit ? FFIType.ffiInt : FFIType.ffiLong;
-
-    if (isType!NativeUIntType(t))
-        return is32Bit ? FFIType.ffiUInt : FFIType.ffiULong;
-
-    if (isType!Float32Type(t))
-        return FFIType.ffiFloat;
-
-    if (isType!Float64Type(t))
-        return FFIType.ffiDouble;
-
-    if (isType!PointerType(t))
-        return FFIType.ffiPointer;
-
-    if (isType!FunctionPointerType(t))
-        return FFIType.ffiPointer;
-
-    if (auto struc = cast(StructureType)t)
-    {
-        synchronized(ffiStructTypeCache)
-        {
-            if (auto cache = ffiStructTypeCache.get(t))
-                return *cache;
-
-            // build a new ffi type
-            auto subTypes = new FFIType*[struc.fields.count];
-            foreach (idx, field; struc.fields)
-                subTypes[idx] = toFFIType(field.y.type);
-
-            auto newItem = new FFIType(subTypes);
-            ffiStructTypeCache.add(t, newItem);
-            return newItem;
-        }
-    }
-
-    throw new InterpreterException("Unsupported type for FFI: " ~ t.name);
+                         auto newItem = new FFIType(subTypes);
+                         ffiStructTypeCache.add(t, newItem);
+                         return newItem;
+                     }
+                 },
+                 ()
+                 {
+                     if (type is null)
+                         return FFIType.ffiVoid; // only valid as return type
+                     throw new InterpreterException("Unsupported type for FFI: " ~ type.name);
+                 });
 }
 
 private FFIInterface toFFIConvention(CallingConvention cc)
