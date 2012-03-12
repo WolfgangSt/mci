@@ -852,19 +852,67 @@ private final class InterpreterContext
                 break;
 
             case OperationCode.fieldGet:
-                size_t size;
-                auto source = structElement(inst.sourceRegister1, *inst.operand.peek!Field(), size);
+                auto field = *inst.operand.peek!Field();
+                auto fieldType = field.type;
+                auto source = getValue(inst.sourceRegister1);
                 auto dest = getValue(inst.targetRegister);
-                memcpy(dest, source, size);
+                auto offset = computeOffset(field, is32Bit);
+                auto memType = inst.sourceRegister1.type;
+                auto mem = getValue(inst.sourceRegister1);
 
+                if (tryCast!ReferenceType(memType))
+                {
+                    auto rto = *cast(RuntimeObject**)mem;
+                    mem = rto.data;
+
+                    if (auto barrier = cast(AtomicGarbageCollector)_interpreter.gc)
+                    {
+                        if (barrier.barriers & BarrierFlags.fieldGet && isManaged(fieldType))
+                        {
+                            auto ptr = cast(RuntimeObject**)(mem + offset);
+                            barrier.fieldGetBarrier(rto, field, ptr, cast(RuntimeObject**)dest);
+                            break;
+                        }
+                    }
+                }
+                else if (tryCast!PointerType(memType))
+                    mem = *cast(ubyte**)mem;
+
+                mem += offset;
+                auto size = computeSize(fieldType, is32Bit);
+                memcpy(dest, mem, size);
                 break;
 
             case OperationCode.fieldSet:
-                size_t size;
-                auto dest = structElement(inst.sourceRegister1, *inst.operand.peek!Field(), size);
+                auto field = *inst.operand.peek!Field();
+                auto fieldType = field.type;
                 auto source = getValue(inst.sourceRegister2);
-                memcpy(dest, source, size);
+                auto dest = getValue(inst.sourceRegister1);
+                auto offset = computeOffset(field, is32Bit);
+                auto memType = inst.sourceRegister1.type;
+                auto mem = getValue(inst.sourceRegister1);
 
+                if (tryCast!ReferenceType(memType))
+                {
+                    auto rto = *cast(RuntimeObject**)mem;
+                    mem = rto.data;
+
+                    if (auto barrier = cast(AtomicGarbageCollector)_interpreter.gc)
+                    {
+                        if (barrier.barriers & BarrierFlags.fieldSet && isManaged(fieldType))
+                        {
+                            auto ptr = cast(RuntimeObject**)(mem + offset);
+                            barrier.fieldSetBarrier(rto, field, ptr, cast(RuntimeObject**)source);
+                            break;
+                        }
+                    }
+                }
+                else if (tryCast!PointerType(memType))
+                    mem = *cast(ubyte**)mem;
+
+                mem += offset;
+                auto size = computeSize(fieldType, is32Bit);
+                memcpy(mem, source, size);
                 break;
 
             case OperationCode.fieldAddr:
@@ -903,19 +951,41 @@ private final class InterpreterContext
             case OperationCode.fieldUserGet:
                 auto rto = *cast(RuntimeObject**)getValue(inst.sourceRegister1);
                 auto dest = getValue(inst.targetRegister);
-                *cast(size_t*)dest = rto.userData;
+
+                if (auto barrier = cast(AtomicGarbageCollector)_interpreter.gc)
+                {
+                    if (barrier.barriers & BarrierFlags.fieldGet)
+                    {
+                        auto ptr = &rto.userData;
+                        barrier.fieldGetBarrier(rto, null, ptr, cast(RuntimeObject**)dest);
+                        break;
+                    }
+                }
+
+                *cast(RuntimeObject**)dest = rto.userData;
                 break;
 
             case OperationCode.fieldUserSet:
                 auto rto = *cast(RuntimeObject**)getValue(inst.sourceRegister1);
                 auto source = getValue(inst.sourceRegister2);
-                rto.userData = *cast(size_t*)source;
+
+                if (auto barrier = cast(AtomicGarbageCollector)_interpreter.gc)
+                {
+                    if (barrier.barriers & BarrierFlags.fieldSet)
+                    {
+                        auto ptr = &rto.userData;
+                        barrier.fieldSetBarrier(rto, null, ptr, cast(RuntimeObject**)source);
+                        break;
+                    }
+                }
+
+                rto.userData = *cast(RuntimeObject**)source;
                 break;
 
             case OperationCode.fieldUserAddr:
                 auto rto = *cast(RuntimeObject**)getValue(inst.sourceRegister1);
                 auto dest = getValue(inst.targetRegister);
-                *cast(ubyte**)dest = cast(ubyte*)&rto.userData;
+                *cast(RuntimeObject***)dest = &rto.userData;
                 break;
 
             case OperationCode.argPush:
@@ -1123,21 +1193,55 @@ private final class InterpreterContext
 
             case OperationCode.arraySet:
                 {
-                    auto src   = getValue(inst.sourceRegister3);
-                    size_t size;
-                    auto dst = arrayElement(inst.sourceRegister1, inst.sourceRegister2, size);
+                    auto source = getValue(inst.sourceRegister3);
+                    auto elementType = inst.sourceRegister3.type;
+                    auto arrayRto = *cast(RuntimeObject**)getValue(inst.sourceRegister1);
+                    auto index = *cast(size_t*)getValue(inst.sourceRegister2);
+                    auto array = arrayRto.data;
+                    auto elementSize = computeSize(elementType, is32Bit);
 
-                    memcpy(dst, src, size);
+                    if (auto arr = cast(ArrayType)inst.sourceRegister1.type)
+                        array += nativeIntSize;
+
+                    array = alignArray(array) + elementSize * index;
+
+                    if (auto barrier = cast(AtomicGarbageCollector)_interpreter.gc)
+                    {
+                        if (barrier.barriers & BarrierFlags.arraySet && isManaged(elementType))
+                        {
+                            barrier.arraySetBarrier(arrayRto, index, cast(RuntimeObject**)(array), cast(RuntimeObject**)source);
+                            break;
+                        }
+                    }
+
+                    memcpy(array, source, elementSize);
                     break;
                 }
 
             case OperationCode.arrayGet:
                 {
-                    auto dst = getValue(inst.targetRegister);
-                    size_t size;
-                    auto src = arrayElement(inst.sourceRegister1, inst.sourceRegister2, size);
+                    auto dest = getValue(inst.targetRegister);
+                    auto elementType = inst.targetRegister.type;
+                    auto arrayRto = *cast(RuntimeObject**)getValue(inst.sourceRegister1);
+                    auto index = *cast(size_t*)getValue(inst.sourceRegister2);
+                    auto array = arrayRto.data;
+                    auto elementSize = computeSize(elementType, is32Bit);
 
-                    memcpy(dst, src, size);
+                    if (auto arr = cast(ArrayType)inst.sourceRegister1.type)
+                        array += nativeIntSize;
+
+                    array = alignArray(array) + elementSize * index;
+
+                    if (auto barrier = cast(AtomicGarbageCollector)_interpreter.gc)
+                    {
+                        if (barrier.barriers & BarrierFlags.arrayGet && isManaged(elementType))
+                        {
+                            barrier.arrayGetBarrier(arrayRto, index, cast(RuntimeObject**)(array), cast(RuntimeObject**)dest);
+                            break;
+                        }
+                    }
+
+                    memcpy(dest, array, elementSize);
                     break;
                 }
 
@@ -1154,13 +1258,7 @@ private final class InterpreterContext
             case OperationCode.arrayLen:
                 {
                     auto dst = getValue(inst.targetRegister);
-                    if (auto vec = cast(VectorType)inst.sourceRegister1.type)
-                    {
-                        *cast(size_t*)dst = vec.elements;
-                        break;
-                    }
-                    auto array = (*cast(RuntimeObject**)getValue(inst.sourceRegister1)).data;
-                    *cast(size_t*)dst = *cast(size_t*)array;
+                    *cast(size_t*)dst = arrayElements(inst.sourceRegister1);
                     break;
                 }
 
@@ -1201,17 +1299,36 @@ private final class InterpreterContext
 
             case OperationCode.memSet:
                 auto size = computeSize(inst.sourceRegister2.type, is32Bit);
-                auto dst = *cast(ubyte**)getValue(inst.sourceRegister1);
+                auto dst = getValue(inst.sourceRegister1);
                 auto src = getValue(inst.sourceRegister2);
-                memcpy(dst, src, size);
 
+                if (auto barrier = cast(AtomicGarbageCollector)_interpreter.gc)
+                {
+                    if (barrier.barriers & BarrierFlags.memorySet && isManaged(inst.sourceRegister2.type))
+                    {
+                        barrier.memorySetBarrier(cast(RuntimeObject**)dst, cast(RuntimeObject**)src);
+                        break;
+                    }
+                }
+
+                memcpy(*cast(ubyte**)dst, src, size);
                 break;
 
             case OperationCode.memGet:
                 auto size = computeSize(inst.targetRegister.type, is32Bit);
-                auto src = *cast(ubyte**)getValue(inst.sourceRegister1);
+                auto src = getValue(inst.sourceRegister1);
                 auto dst = getValue(inst.targetRegister);
-                memcpy(dst, src, size);
+
+                if (auto barrier = cast(AtomicGarbageCollector)_interpreter.gc)
+                {
+                    if (barrier.barriers & BarrierFlags.memoryGet && isManaged(inst.targetRegister.type))
+                    {
+                        barrier.memoryGetBarrier(cast(RuntimeObject**)src, cast(RuntimeObject**)dst);
+                        break;
+                    }
+                }
+
+                memcpy(dst, *cast(ubyte**)src, size);
                 break;
 
             case OperationCode.memFree:
