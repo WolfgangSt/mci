@@ -1,6 +1,7 @@
 module mci.interpreter.interpreter;
 
-import core.stdc.string,
+import core.atomic,
+       core.stdc.string,
        core.memory,
        core.thread,
        ffi,
@@ -14,6 +15,7 @@ import core.stdc.string,
        mci.core.typing.core,
        mci.core.typing.members,
        mci.core.typing.types,
+       mci.core.weak,
        mci.core.code.opcodes,
        mci.interpreter.allocator,
        mci.interpreter.debuggee,
@@ -1559,16 +1561,32 @@ private Function toFunction(ubyte* mem)
 
 private InterpreterContext currentContext;
 private ExceptionRecord currentException;
-private Dictionary!(Tuple!(Interpreter, Field), ubyte*, false) tlsGlobals;
+private Dictionary!(Tuple!(Weak!Interpreter, Field), ubyte*, false) tlsGlobals;
+private size_t localTLSColor;
+private __gshared size_t globalTLSColor;
 
 static this()
 {    
-    tlsGlobals = new Dictionary!(Tuple!(Interpreter, Field), ubyte*, false);
+    tlsGlobals = new typeof(tlsGlobals)();
 }
 
-static ~this()
+private void compactTLSGlobals()
 {
-    // need to release all globals belonging to the threads interpreter here
+    while (true)
+    {
+        auto globalColor = atomicLoad(*cast(shared)&globalTLSColor);
+        if (localTLSColor == globalColor)
+            break;
+
+        localTLSColor = globalColor;
+        auto compactedGlobals = new Dictionary!(Tuple!(Weak!Interpreter, Field), ubyte*, false);
+        foreach (kv; tlsGlobals)
+        {
+            if (kv.x.x.object)
+                compactedGlobals.add(kv.x, kv.y);
+        }
+        tlsGlobals = compactedGlobals;
+    }
 }
 
 private void step()
@@ -1597,6 +1615,7 @@ private void switchToContext(InterpreterContext context)
 
 public final class Interpreter : ExecutionEngine
 {
+    private Weak!Interpreter _weakThis;
     private GarbageCollector _gc;
     private Dictionary!(Function, FFIClosure, false) _closureCache;
     private Dictionary!(Field, ubyte*, false) _globals;
@@ -1611,12 +1630,20 @@ public final class Interpreter : ExecutionEngine
     }
     body
     {
+        _weakThis = new Weak!Interpreter(this);
         _gc = gc;
         _closureCache = new Dictionary!(Function, FFIClosure, false);
         _globals = new Dictionary!(Field, ubyte*, false);
         _stackAlloc = new StackAllocator(_gc);
         _vmContext = new VirtualMachineContext(this);
         _debugger = new InterpreterDebuggerServer(this);
+    }
+
+    ~this()
+    {
+        // Notice other threads that an Interpreter died. During their next TLS access 
+        // they will sync their thread local tlsGlobals using compactTLSGlobals()
+        atomicOp!"+="(*cast(shared)&globalTLSColor, 1);
     }
 
     @property public GarbageCollector gc()
@@ -1686,7 +1713,8 @@ public final class Interpreter : ExecutionEngine
     {
         if (f.storage == FieldStorage.thread)
         {
-            auto key = tuple(this, f);
+            compactTLSGlobals();
+            auto key = tuple(_weakThis, f);
             if (auto cache = tlsGlobals.get(key))
                 return *cache;
 
