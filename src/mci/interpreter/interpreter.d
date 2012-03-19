@@ -27,7 +27,7 @@ import core.stdc.string,
        mci.vm.memory.info,
        mci.vm.memory.layout,
        mci.vm.memory.prettyprint,
-       mci.vm.thread.thread,
+       mci.vm.threading.cleanup,
        std.c.stdlib,
        std.socket,
        std.stdio,
@@ -42,6 +42,7 @@ extern (C) void rt_moduleTlsDtor();
 alias calloc _calloc;
 alias free _free;
 alias void delegate() ExceptionHandler;
+alias mci.core.config.is32Bit is32Bit;
 
 static if (isPosix)
 {
@@ -57,7 +58,7 @@ private struct InstructionPointer
 {
     public Function fun;
     public BasicBlock block;
-    public int instructionIndex;
+    public uint instructionIndex;
 }
 
 private final class ExceptionRecord
@@ -1614,7 +1615,7 @@ public final class Interpreter : ExecutionEngine
         _closureCache = new Dictionary!(Function, FFIClosure, false);
         _globals = new Dictionary!(Field, ubyte*, false);
         _stackAlloc = new StackAllocator(_gc);
-        _vmContext = new VirtualMachineContext(gc);
+        _vmContext = new VirtualMachineContext(this);
         _debugger = new InterpreterDebuggerServer(this);
     }
 

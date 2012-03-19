@@ -1,7 +1,6 @@
 module mci.interpreter.exception;
 
-import mci.core.exception,
-	mci.core.diagnostics.debugging;
+import mci.core.exception;
 
 public class InterpreterException : CompilerException
 {

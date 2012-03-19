@@ -233,7 +233,7 @@ public final class AssemblerTool : Tool
                 if (result !is null)
                 {
                     writeln("The program quitted with:");
-                    writeln( prettyPrint( result.type, is32Bit, result.data, "(return value)" ) );
+                    writeln( prettyPrint( result.type, mci.core.config.is32Bit, result.data, "(return value)" ) );
                 }
                 else
                     writeln("The program quitted without return value.");
