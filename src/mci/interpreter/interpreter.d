@@ -16,6 +16,7 @@ import core.stdc.string,
        mci.core.typing.types,
        mci.core.code.opcodes,
        mci.interpreter.allocator,
+       mci.interpreter.debuggee,
        mci.interpreter.exception,
        mci.core.code.instructions,
        mci.vm.execution,
@@ -28,6 +29,7 @@ import core.stdc.string,
        mci.vm.memory.prettyprint,
        mci.vm.thread.thread,
        std.c.stdlib,
+       std.socket,
        std.stdio,
        std.string,
        std.traits,
@@ -727,6 +729,9 @@ private final class InterpreterContext
     public void step()
     {
         auto inst = ip.block.stream[ip.instructionIndex++];
+
+        // check for debugging
+        //if (_interpreter.)
 
         //writefln("%s.%s.%s: %s", ip.block.function_.name, ip.block.name, ip.instructionIndex - 1, inst.toString());
 
@@ -1596,6 +1601,7 @@ public final class Interpreter : ExecutionEngine
     private Dictionary!(Field, ubyte*, false) _globals;
     private StackAllocator _stackAlloc;
     private VirtualMachineContext _vmContext;
+    private InterpreterDebuggerServer _debugger;
 
     public this(GarbageCollector gc)
     in
@@ -1609,6 +1615,7 @@ public final class Interpreter : ExecutionEngine
         _globals = new Dictionary!(Field, ubyte*, false);
         _stackAlloc = new StackAllocator(_gc);
         _vmContext = new VirtualMachineContext(gc);
+        _debugger = new InterpreterDebuggerServer(this);
     }
 
     @property public GarbageCollector gc()
@@ -1667,6 +1674,8 @@ public final class Interpreter : ExecutionEngine
         }
 
         switchToContext(context);
+        if (_debugger)
+            _debugger.waitForDebugger(context.ip);
         run();
 
         return result;
@@ -1862,4 +1871,7 @@ public final class Interpreter : ExecutionEngine
 
         ffiCall(entry, returnType, argTypes, returnMem, argMem, cconv); 
     }
+
+    void startDebugger(Address address) {}
+    void stopDebugger() {}
 }
