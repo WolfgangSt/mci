@@ -46,6 +46,8 @@ alias free _free;
 alias void delegate() ExceptionHandler;
 alias mci.core.config.is32Bit is32Bit;
 
+enum bool longjmpUnwind = true;
+
 static if (isPosix)
 {
     import std.c.linux.linux; 
@@ -54,6 +56,18 @@ static if (isPosix)
 static if (architecture == Architecture.x86)
 {
     import core.cpuid;
+}
+
+static if (longjmpUnwind)
+{
+    static if (isPosix)
+    {
+        import core.sys.posix.setjmp;
+    }
+    else
+    {
+        static assert(false, "longjmp is only supported for POSIX systems.");
+    }
 }
 
 private struct InstructionPointer
@@ -103,6 +117,7 @@ private final class InterpreterContext
 {
     public InstructionPointer ip;
     public InterpreterContext returnContext;
+    public bool nativeTransition; // stop flag that signals run() to return once this stackframe is reached
     public ubyte* returnMem;
     public ubyte*[] args;
     private int _argIndex;
@@ -533,7 +548,7 @@ private final class InterpreterContext
     {
         try
         {
-           _interpreter.dispatchFFI!isIntrinsic(paramTypes, _returnType, convention, entry, returnMem, args);
+            _interpreter.dispatchFFI!isIntrinsic(paramTypes, _returnType, convention, entry, returnMem, args);
         } 
         catch (UnwindException)
         {
@@ -542,7 +557,7 @@ private final class InterpreterContext
             // in case the FFI has noreturn semantics
             // The downside of this approach is that stack traces will only work down
             // to the latest FFI that has been unwound
-            currentContext.returnContext = this;
+            //currentContext.returnContext = this;
             unwindException();
         }
     }
@@ -702,6 +717,8 @@ private final class InterpreterContext
         auto lastCtx = this;
         for (auto ctx = this; ctx; ctx = ctx.returnContext)
         {
+            if (ctx.nativeTransition)
+                break;
             auto block = ctx.ip.block.unwindBlock;
             if (block)
             {
@@ -1596,8 +1613,15 @@ private void step()
 
 private void run()
 {
-    while (currentContext && currentContext.ready)
+    while (currentContext)
+    {
+        if (currentContext.nativeTransition)
+        {
+            currentContext.nativeTransition = false;
+            return;
+        }
         currentContext.step();
+    }
 }
 
 private void setException(ExceptionRecord exception)
@@ -1773,6 +1797,9 @@ public final class Interpreter : ExecutionEngine
 
         context.args = serializeArgs(function_.parameters, argMem);
         context.returnMem = returnMem;
+        context.returnContext = currentContext;
+        if (context.returnContext)
+            context.returnContext.nativeTransition = true;
 
         // run
         switchToContext(context);
@@ -1807,11 +1834,24 @@ public final class Interpreter : ExecutionEngine
         foreach (idx, p; params)
             argTypes[idx] = toFFIType(p.type);
 
-        auto eh = delegate void()
+        ExceptionHandler eh;
+        static if (longjmpUnwind)
         {
-            // we need to abort the current FFI here!
-            throw unwindException;           
-        };
+            auto jb = new jmp_buf[1]; // FIXME: dmd has linktime issues with a plain jmp_buf inside a closure
+            auto callContext = currentContext;
+            eh = delegate void()
+            {
+                longjmp(jb[0], 1);
+            };
+        }
+        else
+        {
+            eh = delegate void()
+            {
+                // we need to abort the current FFI here!
+                throw unwindException;
+            };
+        }
 
         // careful, as trampoline invocations from native code consume stack until emulation returns.
         // In case a ffi happens during this emulation with noreturn semantics but rather invoking
@@ -1827,7 +1867,16 @@ public final class Interpreter : ExecutionEngine
                 registerThreadCleanup(&cleanupThread);
             }
             _gc.attach();
-     
+
+            static if (longjmpUnwind)
+            {
+                if (setjmp(jb[0]) == 1)
+                {
+                    callContext.unwindException();
+                    return;
+                }
+            }
+
             runFunction(function_, cast(ubyte*)ret, cast(ubyte**)args, eh);
         };
 
