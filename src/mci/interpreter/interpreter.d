@@ -45,10 +45,11 @@ alias calloc _calloc;
 alias free _free;
 alias void delegate() ExceptionHandler;
 alias mci.core.config.is32Bit is32Bit;
+alias core.atomic.atomicLoad atomicLoad;
 
 enum bool longjmpUnwind = true;
 
-static if (isPosix)
+static if (isPOSIX)
 {
     import std.c.linux.linux; 
 }
@@ -60,7 +61,7 @@ static if (architecture == Architecture.x86)
 
 static if (longjmpUnwind)
 {
-    static if (isPosix)
+    static if (isPOSIX)
     {
         import core.sys.posix.setjmp;
     }
@@ -81,7 +82,7 @@ private final class ExceptionRecord
 {
     public InstructionPointer ip;
     public Type type;
-    public ubyte* data;
+    public RuntimeObject** data;
     private GarbageCollector _gc;
     private InterpreterContext _ctx;
 
@@ -92,10 +93,10 @@ private final class ExceptionRecord
         _gc = ctx._interpreter._gc;
         _ctx = ctx;
 
-        data = cast(ubyte*)_calloc(1, nativeIntSize);
+        data = cast(RuntimeObject**)_calloc(1, nativeIntSize);
         _gc.addRoot(data);
 
-        *cast(RuntimeObject**)data = *cast(RuntimeObject**)ctx.getValue(exception);
+        *data = *cast(RuntimeObject**)ctx.getValue(exception);
     }
 
     public void printStackTrace()
@@ -278,8 +279,24 @@ private final class InterpreterContext
     public void loadRegister(T)(Register reg, InstructionOperand value)
     {
         auto src = value.peek!T();
-        auto dst = cast(T*)_registerState[reg];
-        *dst = *src;
+        static if (is(T == Function))
+        {
+            if ((cast(FunctionPointerType)reg.type).callingConvention == CallingConvention.standard)
+            {
+                auto dst = cast(T*)_registerState[reg];
+                *dst = *src;
+            }
+            else
+            {
+                auto dst = cast(FFIFunction*)_registerState[reg];
+                *dst = *_interpreter.getClosure(*src).function_;
+            }
+        }
+        else
+        {            
+            auto dst = cast(T*)_registerState[reg];
+            *dst = *src;
+        }
     }
 
     public void loadArray(T)(Register reg, InstructionOperand value)
@@ -599,8 +616,6 @@ private final class InterpreterContext
             dst = getValue(inst.targetRegister);
 
         dispatchFFI!false(ffiSig.parameterTypes, ffiSig.returnType, ffiSig.callingConvention, fptr, dst, args);
-
-        throw new InterpreterException("Foreign Function Interfacing not supported yet");
     }
 
     private void allocate(Register target, size_t count)
@@ -853,6 +868,19 @@ private final class InterpreterContext
             case OperationCode.loadFunc:
                 // this assumes that a Function (ref) fits into a function pointer
                 loadRegister!Function(inst.targetRegister, inst.operand);
+                break;
+
+            case OperationCode.tramp:
+                switch ((cast(FunctionPointerType)inst.sourceRegister1.type).callingConvention)
+                {
+                    case CallingConvention.standard:
+                        auto src = cast(Function*)getValue(inst.sourceRegister1);
+                        auto dst = cast(FFIFunction*)getValue(inst.targetRegister);
+                        *dst = *_interpreter.getClosure(*src).function_;
+                        break;
+                    default:
+                        throw new InterpreterException("tranmpoline from non standard to non standard not implemented, yet");
+                }
                 break;
 
             case OperationCode.loadNull:
@@ -1725,12 +1753,38 @@ public final class Interpreter : ExecutionEngine
             context.args = args;
         }
 
+        context.returnContext = currentContext;
+        if (context.returnContext)
+            context.returnContext.nativeTransition = true;
+
         switchToContext(context);
         if (_debugger)
             _debugger.waitForDebugger(context.ip);
         run();
 
         return result;
+    }
+
+    public RuntimeValue execute(function_t function_, CallingConvention callingConvention, Type returnType, NoNullList!RuntimeValue arguments)
+    {
+        if (callingConvention == CallingConvention.standard)
+        {
+            // function will be a Function reference as it was loaded via a load.func of this interpreter
+            // at an earlier point
+            return execute(cast(Function)function_, arguments);
+        }
+
+        // invoke via FFI
+        RuntimeValue result;
+        ubyte* returnMem;
+        if (returnType)
+        {
+            result = new RuntimeValue(_gc, returnType);
+            returnMem = result.data;
+        }
+
+        dispatchFFI!false(arguments, returnType, callingConvention, function_, returnMem, arguments);
+        return result; 
     }
 
     private ubyte* getGlobal(Field f)
@@ -1760,7 +1814,7 @@ public final class Interpreter : ExecutionEngine
 
         writefln("Unhandled exception thrown at %s.%s.%s: %s", ex.ip.block.function_.name, ex.ip.block.name, ex.ip.instructionIndex - 1, inst.toString());
         writeln("==========  Exception  ==========");
-        writeln(prettyPrint(ex.type, is32Bit, ex.data, "exception"));
+        writeln(prettyPrint(ex.type, is32Bit, cast(ubyte*)ex.data, "exception"));
         writeln("========== Stack Trace ==========");
         ex.printStackTrace();
         writeln("=================================");
@@ -1785,7 +1839,7 @@ public final class Interpreter : ExecutionEngine
 
     private void runFunction(Function function_, ubyte* returnMem, ubyte** argMem, ExceptionHandler eh)
     {
-        if (function_.attributes == FunctionAttributes.intrinsic)
+        if (function_.attributes & FunctionAttributes.intrinsic)
         {
             auto fptr = intrinsicFunctions[function_];
             dispatchFFI!true(function_.parameters, function_.returnType, CallingConvention.cdecl, fptr, returnMem, argMem); 
@@ -1860,7 +1914,7 @@ public final class Interpreter : ExecutionEngine
         // But there is not much we can do about this for the moment.
         auto trampoline = delegate void(void* ret, void** args) 
         { 
-            if (!tlsGlobals)
+            if (!Thread.getThis())
             {
                 thread_attachThis();
                 rt_moduleTlsCtor();
@@ -1899,21 +1953,6 @@ public final class Interpreter : ExecutionEngine
         _gc.free(r);
     }
 
-    private ubyte* getParamMem(ubyte* mem, Type t)
-    {
-        if (auto fptr = cast(FunctionPointerType)t)
-        {
-            // The supplied argument is either a native function pointer or a pointer to a Function object. 
-            // In the latter case we need to create a trampoline to the emulator
-
-            if (auto fun = toFunction(mem))
-                return cast(ubyte*)getClosure(fun).function_;
-            
-            return mem;
-        }
-        return mem;
-    }
-
     private void dispatchFFI(bool isIntrinsic, T, U)(ReadOnlyIndexable!T paramTypes, Type _returnType, CallingConvention convention, 
                             FFIFunction entry, ubyte* returnMem, U args)
     {
@@ -1928,9 +1967,9 @@ public final class Interpreter : ExecutionEngine
 
         foreach (idx, p; paramTypes)
         {
-            static if (is(T == Parameter)) 
+            static if (is(T == Parameter) || is(T == RuntimeValue)) 
                 auto t = p.type;
-            else 
+            else
                 auto t = p;
 
             auto i = idx;
@@ -1938,7 +1977,10 @@ public final class Interpreter : ExecutionEngine
                 i++;
 
             argTypes[i] = toFFIType(t);
-            argMem[i] = getParamMem(args[i], t);
+
+            static if (is(typeof(args[i]) == RuntimeValue))
+                argMem[i] = args[i].data;
+            else argMem[i] = args[i];
         }
 
         static if (isIntrinsic)

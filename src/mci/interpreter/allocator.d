@@ -53,12 +53,12 @@ private final class StackAllocatorBlock
         _mem = cast(ubyte*)calloc(_size, 1);
         
         _sizeInWords = sizeInWords;
-        _allocator._gc.addRange(_mem, sizeInWords);
+        _allocator._gc.addRange(cast(RuntimeObject**)_mem, sizeInWords);
     }
 
     private void releaseBlock()
     {
-        _allocator._gc.removeRange(_mem, _sizeInWords);
+        _allocator._gc.removeRange(cast(RuntimeObject**)_mem, _sizeInWords);
         .free(_mem);
         _size = 0;
         _load = 0;
