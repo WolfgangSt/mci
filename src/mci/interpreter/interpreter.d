@@ -21,6 +21,7 @@ import core.atomic,
        mci.interpreter.debuggee,
        mci.interpreter.exception,
        mci.core.code.instructions,
+       mci.vm.exception,
        mci.vm.execution,
        mci.vm.intrinsics.context,
        mci.vm.intrinsics.declarations,
@@ -30,6 +31,7 @@ import core.atomic,
        mci.vm.memory.layout,
        mci.vm.memory.prettyprint,
        mci.vm.threading.cleanup,
+       mci.vm.trace,
        std.c.stdlib,
        std.socket,
        std.stdio,
@@ -99,13 +101,22 @@ private final class ExceptionRecord
         *data = *cast(RuntimeObject**)ctx.getValue(exception);
     }
 
-    public void printStackTrace()
+    @property public NoNullList!StackFrame frames()
     {
+        auto frames = new NoNullList!StackFrame();
         for (auto ctx = _ctx; ctx; ctx = ctx.returnContext)
         {
             auto inst = ctx.ip.block.stream[ctx.ip.instructionIndex - 1];
-            writefln("%s.%s.%s: %s", ctx.ip.block.function_.name, ctx.ip.block.name, ctx.ip.instructionIndex - 1, inst.toString());
+            frames.add(new StackFrame(inst));
         }
+        return frames;
+    }
+
+    @property public RuntimeValue runtimeValue()
+    {
+        auto rv = new RuntimeValue(_gc, type);
+        *cast(RuntimeObject**)rv.data = *data;
+        return rv;
     }
 
     public void release()
@@ -1462,7 +1473,7 @@ private final class InterpreterContext
                 break;
 
             case OperationCode.ehCatch:
-                *cast(RuntimeObject**)getValue(inst.targetRegister) = *cast(RuntimeObject**)currentException.data;
+                *cast(RuntimeObject**)getValue(inst.targetRegister) = *currentException.data;
                 break;
 
             //default:
@@ -1809,17 +1820,7 @@ public final class Interpreter : ExecutionEngine
 
     private void defaultExceptionHandler()
     {
-        auto ex = currentException;
-        auto inst = ex.ip.block.stream[ex.ip.instructionIndex - 1];
-
-        writefln("Unhandled exception thrown at %s.%s.%s: %s", ex.ip.block.function_.name, ex.ip.block.name, ex.ip.instructionIndex - 1, inst.toString());
-        writeln("==========  Exception  ==========");
-        writeln(prettyPrint(ex.type, is32Bit, cast(ubyte*)ex.data, "exception"));
-        writeln("========== Stack Trace ==========");
-        ex.printStackTrace();
-        writeln("=================================");
-
-        throw new InterpreterException("Unhandled ial exception");
+        throw new ExecutionException(new StackTrace(currentException.frames), currentException.runtimeValue, "Unhandled ial exception");
     }
 
     private ubyte*[] serializeArgs(ReadOnlyIndexable!Parameter params, ubyte** argMem)

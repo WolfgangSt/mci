@@ -18,10 +18,12 @@ import std.getopt,
        mci.core.io,
        mci.core.code.functions,
        mci.core.code.modules,
+       mci.vm.exception,
        mci.vm.execution,
        mci.vm.intrinsics.declarations,
        mci.vm.io.writer,
        mci.vm.memory.prettyprint,
+       mci.vm.trace,
        mci.cli.main,
        mci.cli.tool,
        mci.cli.tools.interpreter,
@@ -228,15 +230,37 @@ public final class AssemblerTool : Tool
                 ExecutionEngine interpreter = new Interpreter(gc);
                 auto main = mod.functions["main"];
                 auto params = new NoNullList!RuntimeValue();
-                auto result = interpreter.execute(main, params);
 
-                if (result !is null)
+                try
                 {
-                    writeln("The program quitted with:");
-                    writeln( prettyPrint( result.type, mci.core.config.is32Bit, result.data, "(return value)" ) );
+                    auto result = interpreter.execute(main, params);
+
+                    if (result !is null)
+                    {
+                        logf("The program quitted with:");
+                        logf( prettyPrint( result.type, mci.core.config.is32Bit, result.data, "(return value)" ) );
+                    }
+                    else
+                        logf("The program quitted without return value.");
                 }
-                else
-                    writeln("The program quitted without return value.");
+                catch (ExecutionException ex)
+                {
+                    auto faultPoint = ex.trace.frames[0].instruction;
+                    auto faultBlock = faultPoint.block;
+                    auto instructionIndex = findIndex(faultBlock.stream, faultPoint);
+                    logf("Unhandled exception thrown at %s.%s.%s: %s", faultBlock.function_.name, faultBlock.name, instructionIndex, faultPoint.toString());
+                    logf("==========  Exception  ==========");
+                    logf(prettyPrint(ex.exception.type, mci.core.config.is32Bit, cast(ubyte*)ex.exception.data, "exception"));
+                    logf("========== Stack Trace ==========");
+                    foreach (StackFrame frame; ex.trace.frames)
+                    {
+                        auto inst = frame.instruction;
+                        auto block = inst.block;
+                        auto index = findIndex(block.stream, inst);
+                        logf("%s.%s.%s: %s", block.function_.name, block.name, index, inst.toString());
+                    }
+                    logf("=================================");
+                }
 
                 return true;
             }
