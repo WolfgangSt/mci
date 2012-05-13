@@ -9,7 +9,7 @@ import core.sync.condition,
        mci.debugger.server,
        mci.debugger.protocol,
        mci.interpreter.interpreter,
-       mci.vm.threading.id;
+       mci.vm.threading.identity;
 
 /*
 void fail()

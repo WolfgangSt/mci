@@ -26,7 +26,7 @@ import core.atomic,
        mci.vm.intrinsics.context,
        mci.vm.intrinsics.declarations,
        mci.vm.memory.base,
-       mci.vm.memory.entrypoint,
+       mci.vm.ffi,
        mci.vm.memory.info,
        mci.vm.memory.layout,
        mci.vm.memory.prettyprint,
@@ -593,7 +593,7 @@ private final class InterpreterContext
     private void doFFI(Instruction inst)
     {
         auto ffisig = *inst.operand.peek!FFISignature();
-        auto fptr = cast(FFIFunction)resolveEntryPoint(ffisig);
+        auto fptr = cast(FFIFunction)_interpreter.resolveEntryPoint(ffisig);
 
         if (fptr is null)
             throw new InterpreterException("Cannot resolve export " ~ ffisig.entryPoint ~ " in " ~ ffisig.library);
@@ -1685,6 +1685,8 @@ public final class Interpreter : ExecutionEngine
     private StackAllocator _stackAlloc;
     private VirtualMachineContext _vmContext;
     private InterpreterDebuggerServer _debugger;
+    private Dictionary!(string, void*) _ffiLibraries;
+    private Dictionary!(Tuple!(string, string), EntryPoint) _ffiEntrypoints;
 
     public this(GarbageCollector gc)
     in
@@ -1693,13 +1695,16 @@ public final class Interpreter : ExecutionEngine
     }
     body
     {
+        super(gc);
         _weakThis = new Weak!Interpreter(this);
         _gc = gc;
         _closureCache = new Dictionary!(Function, FFIClosure, false);
         _globals = new Dictionary!(Field, ubyte*, false);
         _stackAlloc = new StackAllocator(_gc);
-        _vmContext = new VirtualMachineContext(this);
         _debugger = new InterpreterDebuggerServer(this);
+        _vmContext = context;
+        _ffiLibraries = new Dictionary!(string, void*)();
+        _ffiEntrypoints = new Dictionary!(Tuple!(string, string), EntryPoint)();
     }
 
     ~this()
@@ -1707,29 +1712,13 @@ public final class Interpreter : ExecutionEngine
         // Notice other threads that an Interpreter died. During their next TLS access 
         // they will sync their thread local tlsGlobals using compactTLSGlobals()
         atomicOp!"+="(*cast(shared)&globalTLSColor, 1);
+
+        // unload all ffi librarys
+        foreach (void* lib; _ffiLibraries.values)
+            closeLibrary(lib);
     }
 
-    @property public GarbageCollector gc()
-    out (result)
-    {
-        assert(result);
-    }
-    body
-    {
-        return _gc;
-    }
-
-    @property public VirtualMachineContext context()
-    out (result)
-    {
-        assert(result);
-    }
-    body
-    {
-        return _vmContext;
-    }
-
-    public RuntimeValue execute(Function function_, NoNullList!RuntimeValue arguments)
+    public override RuntimeValue execute(Function function_, NoNullList!RuntimeValue arguments)
     in
     {
         assert(function_);
@@ -1776,7 +1765,7 @@ public final class Interpreter : ExecutionEngine
         return result;
     }
 
-    public RuntimeValue execute(function_t function_, CallingConvention callingConvention, Type returnType, NoNullList!RuntimeValue arguments)
+    public override RuntimeValue execute(function_t function_, CallingConvention callingConvention, Type returnType, NoNullList!RuntimeValue arguments)
     {
         if (callingConvention == CallingConvention.standard)
         {
@@ -1993,6 +1982,33 @@ public final class Interpreter : ExecutionEngine
         ffiCall(entry, returnType, argTypes, returnMem, argMem, cconv); 
     }
 
-    void startDebugger(Address address) {}
-    void stopDebugger() {}
+    private EntryPoint resolveEntryPoint(FFISignature sig)
+    {
+        auto key = tuple(sig.library, sig.entryPoint);
+        if (auto entry = _ffiEntrypoints.get(key))
+            return *entry;
+
+        auto libp = _ffiLibraries.get(sig.library);
+        void* lib;
+        if (libp)
+            lib = *libp;
+        else
+        {
+            // try to load the library
+            lib = openLibrary(sig.library);
+            if (!lib)
+                return null;
+            _ffiLibraries.add(sig.library, lib);
+        }
+
+        auto entry = getProcedure(lib, sig.entryPoint);
+        if (!entry)
+            return null;
+
+        _ffiEntrypoints.add(key, entry);
+        return entry;
+    }
+
+    override void startDebugger(Address address) {}
+    override void stopDebugger() {}
 }

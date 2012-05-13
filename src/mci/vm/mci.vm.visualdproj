@@ -215,7 +215,6 @@
    <File path="memory\boehm.d" />
    <File path="memory\dgc.d" />
    <File path="memory\finalization.d" />
-   <File path="memory\entrypoint.d" />
    <File path="memory\info.d" />
    <File path="memory\layout.d" />
    <File path="memory\libc.d" />
