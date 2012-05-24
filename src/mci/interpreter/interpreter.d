@@ -1562,7 +1562,7 @@ private FFIType* toFFIType(Type type)
                  {
                      ffiStructTypeCacheMutex.lock();
 
-                     scope(exit)
+                     scope (exit)
                          ffiStructTypeCacheMutex.unlock();
 
                      if (auto cache = ffiStructTypeCache.get(t))
@@ -1735,6 +1735,9 @@ public final class Interpreter : ExecutionEngine
         // unload all ffi librarys
         foreach (void* lib; _ffiLibraries.values)
             closeLibrary(lib);
+
+        _stackAlloc.cleanup();
+        _gc.collect();
     }
 
     public override RuntimeValue execute(Function function_, NoNullList!RuntimeValue arguments)
@@ -1756,7 +1759,7 @@ public final class Interpreter : ExecutionEngine
         {
             _loadedModulesMutex.lock();
 
-            scope(exit)
+            scope (exit)
                 _loadedModulesMutex.unlock();
 
             _loadedModules.add(function_.module_);
@@ -1832,7 +1835,7 @@ public final class Interpreter : ExecutionEngine
         {
             _globalsMutex.lock();
 
-            scope(exit)
+            scope (exit)
                 _globalsMutex.unlock();
 
             if (auto cache = _globals.get(f))
@@ -1889,54 +1892,67 @@ public final class Interpreter : ExecutionEngine
             _stackAlloc.free(param.type);
     }
 
-    private void cleanupThread()
+    private void detachFromRuntime()
     {
+        bool detach;
+
         {
+            auto thisThread = Thread.getThis();
             _attachedThreadsMutex.lock();
 
-            scope(exit)
+            scope (exit)
                 _attachedThreadsMutex.unlock();
 
-            _attachedThreads.remove(Thread.getThis());
+            if (thisThread in _attachedThreads)
+            {
+                _attachedThreads.remove(thisThread);
+                detach = true;
+            }
         }
+
+        if (detach)
+            _gc.detach();
+
         GC.disable();
-        static if (operatingSystem == OperatingSystem.windows)
-            thread_detachThis();
-        else
-            thread_detachByAddr(pthread_self());
+        thread_detachThis();
         rt_moduleTlsDtor();
         GC.enable();
     }
 
     private void attachToRuntime()
     {
-        if (!Thread.getThis())
+        auto thisThread = Thread.getThis();
+        if (!thisThread)
         {
-            thread_attachThis();
+            thisThread = thread_attachThis();
             rt_moduleTlsCtor();
-            registerThreadCleanup(&cleanupThread);
+            registerThreadCleanup(&detachFromRuntime);
         }
+
+        bool attach;
 
         {
             _attachedThreadsMutex.lock();
 
-            scope(exit)
+            scope (exit)
                 _attachedThreadsMutex.unlock();
 
-            if (_attachedThreads.add(Thread.getThis()))
-            {
-                _gc.attach();
-                {
-                    _loadedModulesMutex.lock();
+            if (_attachedThreads.add(thisThread))
+                attach = true;
+        }
 
-                    scope(exit)
-                        _loadedModulesMutex.unlock();
+        if (attach)
+        {
+            _gc.attach();
 
-                    foreach (Module mod; _loadedModules)
-                        if (mod.threadEntryPoint)
-                            execute(mod.threadEntryPoint, new NoNullList!RuntimeValue());
-                }
-            }
+            _loadedModulesMutex.lock();
+
+            scope (exit)
+                _loadedModulesMutex.unlock();
+
+            foreach (mod; _loadedModules)
+                if (mod.threadEntryPoint)
+                    execute(mod.threadEntryPoint, new NoNullList!RuntimeValue());
         }
     }
 

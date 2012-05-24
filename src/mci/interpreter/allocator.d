@@ -4,6 +4,7 @@ import mci.core.analysis.utilities,
        mci.core.common,
        mci.core.config,
        mci.core.container,
+       mci.core.memory,
        mci.core.typing.core,
        mci.core.typing.types,
        mci.vm.memory.base,
@@ -17,11 +18,6 @@ private __gshared size_t _wordSize;
 shared static this()
 {
     _wordSize = computeSize(NativeUIntType.instance, is32Bit);
-}
-
-private size_t doAlign(size_t value)
-{
-    return (value + _wordSize -1) & -_wordSize;
 }
 
 private final class StackAllocatorBlock
@@ -121,7 +117,7 @@ public final class StackAllocator
 
     public ubyte* allocate(size_t size)
     {
-        size = doAlign(size);
+        size = alignTo(size, _wordSize);
         if (!_topBlock)
             _topBlock = new StackAllocatorBlock(_defaultAllocationSize, this);
         return _topBlock.allocate(size);
@@ -129,7 +125,7 @@ public final class StackAllocator
 
     public void free(size_t size)
     {
-        size = doAlign(size);
+        size = alignTo(size, _wordSize);
         _topBlock.free(size);
     }
 
@@ -141,6 +137,12 @@ public final class StackAllocator
     public void free(Type t)
     {
         free(computeSize(t, is32Bit));
+    }
+
+    public void cleanup()
+    {
+        while (_topBlock)
+            _topBlock.releaseBlock();
     }
 }
 
