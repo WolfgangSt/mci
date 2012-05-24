@@ -211,6 +211,13 @@ public final class AssemblerTool : Tool
             auto writer = new ModuleWriter();
             if (interpret)
             {
+                auto main = mod.entryPoint;
+                if (!main)
+                {
+                    logf("Error: Module %s has no entry point.", mod);                    
+                    return 1;
+                }
+
                 GarbageCollector gc;
                 final switch (gcType)
                 {
@@ -227,19 +234,12 @@ public final class AssemblerTool : Tool
                             break;
                     }
                 }
-                ExecutionEngine interpreter = new Interpreter(gc);
-                auto main = mod.entryPoint;
-                auto params = new NoNullList!RuntimeValue();
 
-                if (!main)
-                {
-                    logf("Error: Module %s has no entry point.", mod);                    
-                    return 1;
-                }
-
+                ExecutionEngine interpreter;
                 try
                 {
-                    auto result = interpreter.execute(main, params);
+                    interpreter = new Interpreter(gc);
+                    auto result = interpreter.execute(main, new NoNullList!RuntimeValue());
 
                     if (result !is null)
                     {
@@ -267,6 +267,11 @@ public final class AssemblerTool : Tool
                     }
                     logf("=================================");
                 }
+
+                // we have to wait up to here because a potential ExecutionException from above
+                // might carry some GC tracked memory
+                interpreter.terminate();
+                gc.terminate();
 
                 return 0;
             }

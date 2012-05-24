@@ -1726,8 +1726,10 @@ public final class Interpreter : ExecutionEngine
         _attachedThreadsMutex = new Mutex();
     }
 
-    ~this()
+    public override void terminate()
     {
+        super.terminate();
+
         // Notice other threads that an Interpreter died. During their next TLS access 
         // they will sync their thread local tlsGlobals using compactTLSGlobals()
         atomicOp!"+="(*cast(shared)&globalTLSColor, 1);
