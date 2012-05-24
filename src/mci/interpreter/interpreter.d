@@ -11,6 +11,7 @@ import core.atomic,
        mci.core.config,
        mci.core.container,
        mci.core.code.functions,
+       mci.core.sync,
        mci.core.tuple,
        mci.core.typing.core,
        mci.core.typing.members,
@@ -1491,6 +1492,7 @@ private final class InterpreterContext
 // shared data
 
 private __gshared Dictionary!(Type, FFIType*, false) ffiStructTypeCache;
+private __gshared Mutex ffiStructTypeCacheMutex;
 private __gshared size_t nativeIntSize;
 private __gshared UnwindException unwindException;
 private __gshared size_t maxPadding;
@@ -1508,6 +1510,7 @@ private class UnwindException : Exception
 shared static this() 
 {
     ffiStructTypeCache = new Dictionary!(Type, FFIType*, false);
+    ffiStructTypeCacheMutex = new Mutex();
     nativeIntSize = computeSize(NativeUIntType.instance, is32Bit);
     unwindException = new UnwindException();
 
@@ -1557,20 +1560,22 @@ private FFIType* toFFIType(Type type)
                  (FunctionPointerType t) => FFIType.ffiPointer,
                  (StructureType t)
                  {
-                     synchronized (ffiStructTypeCache)
-                     {
-                         if (auto cache = ffiStructTypeCache.get(t))
-                             return *cache;
+                     ffiStructTypeCacheMutex.lock();
 
-                         // build a new ffi type
-                         auto subTypes = new FFIType*[t.fields.count];
-                         foreach (idx, field; t.fields)
-                             subTypes[idx] = toFFIType(field.y.type);
+                     scope(exit)
+                         ffiStructTypeCacheMutex.unlock();
 
-                         auto newItem = new FFIType(subTypes);
-                         ffiStructTypeCache.add(t, newItem);
-                         return newItem;
-                     }
+                     if (auto cache = ffiStructTypeCache.get(t))
+                         return *cache;
+
+                     // build a new ffi type
+                     auto subTypes = new FFIType*[t.fields.count];
+                     foreach (idx, field; t.fields)
+                         subTypes[idx] = toFFIType(field.y.type);
+
+                     auto newItem = new FFIType(subTypes);
+                     ffiStructTypeCache.add(t, newItem);
+                     return newItem;
                  },
                  ()
                  {
@@ -1686,6 +1691,7 @@ public final class Interpreter : ExecutionEngine
     private GarbageCollector _gc;
     private Dictionary!(Function, FFIClosure, false) _closureCache;
     private Dictionary!(Field, ubyte*, false) _globals;
+    private Mutex _globalsMutex;
     private StackAllocator _stackAlloc;
     private VirtualMachineContext _vmContext;
     private InterpreterDebuggerServer _debugger;
@@ -1693,6 +1699,8 @@ public final class Interpreter : ExecutionEngine
     private Dictionary!(Tuple!(string, string), EntryPoint) _ffiEntrypoints;
     private HashSet!Module _loadedModules;
     private HashSet!Thread _attachedThreads;
+    private Mutex _loadedModulesMutex;
+    private Mutex _attachedThreadsMutex;
 
     public this(GarbageCollector gc)
     in
@@ -1706,6 +1714,7 @@ public final class Interpreter : ExecutionEngine
         _gc = gc;
         _closureCache = new Dictionary!(Function, FFIClosure, false);
         _globals = new Dictionary!(Field, ubyte*, false);
+        _globalsMutex = new Mutex();
         _stackAlloc = new StackAllocator(_gc);
         _debugger = new InterpreterDebuggerServer(this);
         _vmContext = context;
@@ -1713,6 +1722,8 @@ public final class Interpreter : ExecutionEngine
         _ffiEntrypoints = new Dictionary!(Tuple!(string, string), EntryPoint)();
         _loadedModules = new HashSet!Module();
         _attachedThreads = new HashSet!Thread();
+        _loadedModulesMutex = new Mutex();
+        _attachedThreadsMutex = new Mutex();
     }
 
     ~this()
@@ -1742,8 +1753,14 @@ public final class Interpreter : ExecutionEngine
     }
     body
     {
-        synchronized (_loadedModules)
+        {
+            _loadedModulesMutex.lock();
+
+            scope(exit)
+                _loadedModulesMutex.unlock();
+
             _loadedModules.add(function_.module_);
+        }
         attachToRuntime();
 
         auto context = new InterpreterContext(function_, this, true, &defaultExceptionHandler);
@@ -1811,8 +1828,13 @@ public final class Interpreter : ExecutionEngine
 
             return tlsGlobals[key] = cast(ubyte*)_calloc(1, computeSize(f.type, is32Bit));
         } 
-        else synchronized(_globals)
+        else
         {
+            _globalsMutex.lock();
+
+            scope(exit)
+                _globalsMutex.unlock();
+
             if (auto cache = _globals.get(f))
                 return *cache;
 
@@ -1868,7 +1890,15 @@ public final class Interpreter : ExecutionEngine
     }
 
     private void cleanupThread()
-    {        
+    {
+        {
+            _attachedThreadsMutex.lock();
+
+            scope(exit)
+                _attachedThreadsMutex.unlock();
+
+            _attachedThreads.remove(Thread.getThis());
+        }
         GC.disable();
         static if (operatingSystem == OperatingSystem.windows)
             thread_detachThis();
@@ -1887,13 +1917,21 @@ public final class Interpreter : ExecutionEngine
             registerThreadCleanup(&cleanupThread);
         }
 
-        synchronized (_attachedThreads)
         {
+            _attachedThreadsMutex.lock();
+
+            scope(exit)
+                _attachedThreadsMutex.unlock();
+
             if (_attachedThreads.add(Thread.getThis()))
             {
                 _gc.attach();
-                synchronized (_loadedModules)
                 {
+                    _loadedModulesMutex.lock();
+
+                    scope(exit)
+                        _loadedModulesMutex.unlock();
+
                     foreach (Module mod; _loadedModules)
                         if (mod.threadEntryPoint)
                             execute(mod.threadEntryPoint, new NoNullList!RuntimeValue());
