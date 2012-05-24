@@ -228,8 +228,14 @@ public final class AssemblerTool : Tool
                     }
                 }
                 ExecutionEngine interpreter = new Interpreter(gc);
-                auto main = mod.functions["main"];
+                auto main = mod.entryPoint;
                 auto params = new NoNullList!RuntimeValue();
+
+                if (!main)
+                {
+                    logf("Error: Module %s has no entry point.", mod);                    
+                    return 1;
+                }
 
                 try
                 {
@@ -262,7 +268,7 @@ public final class AssemblerTool : Tool
                     logf("=================================");
                 }
 
-                return true;
+                return 0;
             }
             (new ModuleWriter()).save(mod, output);
         }

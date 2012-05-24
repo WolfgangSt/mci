@@ -300,7 +300,7 @@ private final class InterpreterContext
             else
             {
                 auto dst = cast(FFIFunction*)_registerState[reg];
-                *dst = *_interpreter.getClosure(*src).function_;
+                *dst = *_interpreter.getClosure!(Function, false)(*src).function_;
             }
         }
         else
@@ -882,7 +882,8 @@ private final class InterpreterContext
                 break;
 
             case OperationCode.tramp:
-                switch ((cast(FunctionPointerType)inst.sourceRegister1.type).callingConvention)
+                auto srcType = cast(FunctionPointerType)inst.sourceRegister1.type;
+                switch (srcType.callingConvention)
                 {
                     case CallingConvention.standard:
                         auto src = cast(Function*)getValue(inst.sourceRegister1);
@@ -890,7 +891,10 @@ private final class InterpreterContext
                         *dst = *_interpreter.getClosure(*src).function_;
                         break;
                     default:
-                        throw new InterpreterException("tranmpoline from non standard to non standard not implemented, yet");
+                        auto dstType = cast(FunctionPointerType)inst.targetRegister.type;
+                        auto src = cast(FFIFunction*)getValue(inst.sourceRegister1);
+                        auto dst = cast(FFIFunction*)getValue(inst.targetRegister);
+                        *dst = *_interpreter.getClosure(srcType, dstType, *src).function_;
                 }
                 break;
 
@@ -1687,6 +1691,8 @@ public final class Interpreter : ExecutionEngine
     private InterpreterDebuggerServer _debugger;
     private Dictionary!(string, void*) _ffiLibraries;
     private Dictionary!(Tuple!(string, string), EntryPoint) _ffiEntrypoints;
+    private HashSet!Module _loadedModules;
+    private HashSet!Thread _attachedThreads;
 
     public this(GarbageCollector gc)
     in
@@ -1705,6 +1711,8 @@ public final class Interpreter : ExecutionEngine
         _vmContext = context;
         _ffiLibraries = new Dictionary!(string, void*)();
         _ffiEntrypoints = new Dictionary!(Tuple!(string, string), EntryPoint)();
+        _loadedModules = new HashSet!Module();
+        _attachedThreads = new HashSet!Thread();
     }
 
     ~this()
@@ -1734,6 +1742,10 @@ public final class Interpreter : ExecutionEngine
     }
     body
     {
+        synchronized (_loadedModules)
+            _loadedModules.add(function_.module_);
+        attachToRuntime();
+
         auto context = new InterpreterContext(function_, this, true, &defaultExceptionHandler);
         auto returnType = function_.returnType;
         RuntimeValue result;
@@ -1783,6 +1795,7 @@ public final class Interpreter : ExecutionEngine
             returnMem = result.data;
         }
 
+        attachToRuntime();
         dispatchFFI!false(arguments, returnType, callingConvention, function_, returnMem, arguments);
         return result; 
     }
@@ -1865,18 +1878,56 @@ public final class Interpreter : ExecutionEngine
         GC.enable();
     }
 
-    private FFIClosure getClosure(Function function_)
+    private void attachToRuntime()
     {
-        if (auto cache = _closureCache.get(function_))
-            return *cache;
+        if (!Thread.getThis())
+        {
+            thread_attachThis();
+            rt_moduleTlsCtor();
+            registerThreadCleanup(&cleanupThread);
+        }
+
+        synchronized (_attachedThreads)
+        {
+            if (_attachedThreads.add(Thread.getThis()))
+            {
+                _gc.attach();
+                synchronized (_loadedModules)
+                {
+                    foreach (Module mod; _loadedModules)
+                        if (mod.threadEntryPoint)
+                            execute(mod.threadEntryPoint, new NoNullList!RuntimeValue());
+                }
+            }
+        }
+    }
+
+    private FFIClosure getClosure(T, bool attach = true)(T function_, T source = null, FFIFunction f = null)
+    {
+        static if (is(T == Function))
+        {
+            if (auto cache = _closureCache.get(function_))
+                return *cache;
+        }
 
         // need a trampoline
-        auto params = function_.parameters;
         auto returnType = toFFIType(function_.returnType);
-        auto argTypes = new FFIType*[params.count];
+        FFIType*[] argTypes;
 
-        foreach (idx, p; params)
-            argTypes[idx] = toFFIType(p.type);
+        static if (is(T == Function))
+        {
+            auto params = function_.parameters;
+            argTypes = new FFIType*[params.count];
+            foreach (idx, p; params)
+                argTypes[idx] = toFFIType(p.type);
+        }
+        else
+        {
+            auto params = function_.parameterTypes;
+            argTypes = new FFIType*[params.count];
+            foreach (idx, p; params)
+                argTypes[idx] = toFFIType(p);
+        }
 
         ExceptionHandler eh;
         static if (longjmpUnwind)
@@ -1904,13 +1955,8 @@ public final class Interpreter : ExecutionEngine
         // But there is not much we can do about this for the moment.
         auto trampoline = delegate void(void* ret, void** args) 
         { 
-            if (!Thread.getThis())
-            {
-                thread_attachThis();
-                rt_moduleTlsCtor();
-                registerThreadCleanup(&cleanupThread);
-            }
-            _gc.attach();
+            static if (attach)
+                attachToRuntime();
 
             static if (longjmpUnwind)
             {
@@ -1921,13 +1967,24 @@ public final class Interpreter : ExecutionEngine
                 }
             }
 
-            runFunction(function_, cast(ubyte*)ret, cast(ubyte**)args, eh);
+            static if (is(T == Function))
+                runFunction(function_, cast(ubyte*)ret, cast(ubyte**)args, eh);
+            else
+            {
+                auto sourceconv = toFFIConvention(function_.callingConvention);
+                auto params = function_.parameterTypes.count;
+                auto argsA = new void*[params];
+                for (auto i = 0; i < params; i++)
+                    argsA[i] = args[i];
+                ffiCall(f, returnType, argTypes, ret, argsA, sourceconv); 
+            }
         };
 
         auto cconv = toFFIConvention(function_.callingConvention);
         auto closure = ffiClosure(trampoline, returnType, argTypes, cconv);
 
-        _closureCache.add(function_, closure);
+        static if (is(T == Function))
+            _closureCache.add(function_, closure);
         return closure;
     }
 
