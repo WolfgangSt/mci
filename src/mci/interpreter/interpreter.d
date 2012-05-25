@@ -1719,7 +1719,7 @@ public final class Interpreter : ExecutionEngine
         _globals = new Dictionary!(Field, ubyte*, false);
         _globalsMutex = new Mutex();
         _stackAlloc = new StackAllocator(_gc);
-        _debugger = new InterpreterDebuggerServer(this);
+        //_debugger = new InterpreterDebuggerServer(this);
         _vmContext = context;
         _ffiLibraries = new Dictionary!(string, void*)();
         _ffiEntrypoints = new Dictionary!(Tuple!(string, string), EntryPoint)();
