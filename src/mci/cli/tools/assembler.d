@@ -1,6 +1,8 @@
 module mci.cli.tools.assembler;
 
-import std.getopt,
+import core.memory,
+       std.exception,
+       std.getopt,
        std.path,
        std.stdio,
        std.utf,
@@ -266,6 +268,11 @@ public final class AssemblerTool : Tool
                         logf("%s.%s.%s: %s", block.function_.name, block.name, index, inst.toString());
                     }
                     logf("=================================");
+
+                    clear(ex.exception);
+                    GC.free(cast(void*)ex.exception);
+                    clear(ex);
+                    GC.free(cast(void*)ex);
                 }
 
                 // we have to wait up to here because a potential ExecutionException from above

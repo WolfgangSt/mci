@@ -1743,6 +1743,9 @@ public final class Interpreter : ExecutionEngine
 
         _stackAlloc.cleanup();
         _gc.collect();
+
+        if (auto igc = cast(InteractiveGarbageCollector)_gc)
+            igc.waitForFreeCallbacks();
     }
 
     public override RuntimeValue execute(Function function_, NoNullList!RuntimeValue arguments)
