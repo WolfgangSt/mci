@@ -102,7 +102,7 @@ private final class ExceptionRecord
         *data = *cast(RuntimeObject**)ctx.getValue(exception);
     }
 
-    @property public NoNullList!StackFrame frames()
+    public NoNullList!StackFrame getFrames()
     {
         auto frames = new NoNullList!StackFrame();
         for (auto ctx = _ctx; ctx; ctx = ctx.returnContext)
@@ -113,7 +113,7 @@ private final class ExceptionRecord
         return frames;
     }
 
-    @property public RuntimeValue runtimeValue()
+    public RuntimeValue toRuntimeValue()
     {
         auto rv = new RuntimeValue(_gc, type);
         *cast(RuntimeObject**)rv.data = *data;
@@ -123,6 +123,7 @@ private final class ExceptionRecord
     public void release()
     {
         _gc.removeRoot(data);
+        *data = null;
     }
 }
 
@@ -1479,6 +1480,8 @@ private final class InterpreterContext
 
             case OperationCode.ehCatch:
                 *cast(RuntimeObject**)getValue(inst.targetRegister) = *currentException.data;
+                currentException.release();
+                setException(null);
                 break;
 
             //default:
@@ -1849,7 +1852,11 @@ public final class Interpreter : ExecutionEngine
 
     private void defaultExceptionHandler()
     {
-        throw new ExecutionException(new StackTrace(currentException.frames), currentException.runtimeValue, "Unhandled ial exception");
+        auto trace = new StackTrace(currentException.getFrames());
+        auto rv = currentException.toRuntimeValue();
+        currentException.release();
+        setException(null);
+        throw new ExecutionException(trace, rv, "Unhandled ial exception");
     }
 
     private ubyte*[] serializeArgs(ReadOnlyIndexable!Parameter params, ubyte** argMem)
