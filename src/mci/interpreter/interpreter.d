@@ -281,9 +281,9 @@ private final class InterpreterContext
 
         size = computeSize(field.type, is32Bit); 
 
-        if (tryCast!PointerType(typ))
+        if (cast(PointerType)typ)
             mem = *cast(ubyte**)mem;
-        else if (tryCast!ReferenceType(typ))
+        else if (cast(ReferenceType)typ)
             mem = (*cast(RuntimeObject**)mem).data;
 
         return mem + offset;
@@ -930,7 +930,7 @@ private final class InterpreterContext
                 auto memType = inst.sourceRegister1.type;
                 auto mem = getValue(inst.sourceRegister1);
 
-                if (tryCast!ReferenceType(memType))
+                if (cast(ReferenceType)memType)
                 {
                     auto rto = *cast(RuntimeObject**)mem;
                     mem = rto.data;
@@ -945,7 +945,7 @@ private final class InterpreterContext
                         }
                     }
                 }
-                else if (tryCast!PointerType(memType))
+                else if (cast(PointerType)memType)
                     mem = *cast(ubyte**)mem;
 
                 mem += offset;
@@ -962,7 +962,7 @@ private final class InterpreterContext
                 auto memType = inst.sourceRegister1.type;
                 auto mem = getValue(inst.sourceRegister1);
 
-                if (tryCast!ReferenceType(memType))
+                if (cast(ReferenceType)memType)
                 {
                     auto rto = *cast(RuntimeObject**)mem;
                     mem = rto.data;
@@ -977,7 +977,7 @@ private final class InterpreterContext
                         }
                     }
                 }
-                else if (tryCast!PointerType(memType))
+                else if (cast(PointerType)memType)
                     mem = *cast(ubyte**)mem;
 
                 mem += offset;
@@ -1403,7 +1403,7 @@ private final class InterpreterContext
 
             case OperationCode.memFree:
                 auto mem = *cast(ubyte**)getValue(inst.sourceRegister1);
-                if (tryCast!PointerType(inst.sourceRegister1.type))
+                if (cast(PointerType)inst.sourceRegister1.type)
                     _free(mem);
                 else
                     _interpreter._gc.free(cast(RuntimeObject*)mem);
@@ -1923,7 +1923,12 @@ public final class Interpreter : ExecutionEngine
         }
 
         if (detach)
+        {
+            foreach (mod; _loadedModules)
+                if (mod.threadExitPoint)
+                    execute(mod.threadExitPoint, new NoNullList!RuntimeValue());
             _gc.detach();
+        }
 
         GC.disable();
         thread_detachThis();
