@@ -269,10 +269,11 @@ public final class AssemblerTool : Tool
                     }
                     logf("=================================");
 
-                    clear(ex.exception);
-                    GC.free(cast(void*)ex.exception);
+                    auto rtv = ex.exception;
                     clear(ex);
                     GC.free(cast(void*)ex);
+                    clear(rtv);
+                    GC.free(cast(void*)rtv);
                 }
 
                 // we have to wait up to here because a potential ExecutionException from above
