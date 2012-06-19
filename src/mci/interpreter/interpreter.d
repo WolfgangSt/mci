@@ -54,7 +54,7 @@ enum bool longjmpUnwind = true;
 
 static if (isPOSIX)
 {
-    import std.c.linux.linux; 
+    import std.c.linux.linux;
 }
 
 static if (architecture == Architecture.x86)
@@ -149,7 +149,7 @@ private final class InterpreterContext
 
     public void gotoBlock(string name)
     {
-        gotoBlock(ip.fun.blocks[name]);        
+        gotoBlock(ip.fun.blocks[name]);
     }
 
     public void gotoEntry()
@@ -189,7 +189,7 @@ private final class InterpreterContext
 
     private void allocateLocals()
     {
-        _registerState = new Dictionary!(Register, ubyte*, false)();
+        _registerState = new typeof(_registerState)();
         foreach (namereg; ip.fun.registers)
         {
             auto reg = namereg.y;
@@ -279,7 +279,7 @@ private final class InterpreterContext
         auto offset = computeOffset(field, is32Bit);
         auto typ = structReg.type;
 
-        size = computeSize(field.type, is32Bit); 
+        size = computeSize(field.type, is32Bit);
 
         if (cast(PointerType)typ)
             mem = *cast(ubyte**)mem;
@@ -306,7 +306,7 @@ private final class InterpreterContext
             }
         }
         else
-        {            
+        {
             auto dst = cast(T*)_registerState[reg];
             *dst = *src;
         }
@@ -318,7 +318,7 @@ private final class InterpreterContext
         allocate(reg, data.count);
         auto dst = arrayOrPointerElementFirst(reg);
         auto mem = cast(T*)dst;
-        
+
         foreach (idx, value; data)
             mem[idx] = value;
     }
@@ -383,9 +383,9 @@ private final class InterpreterContext
         return rotate!("left")(l, cast(T)r);
     }
 
-    private void binaryDispatcher2(string fun, T1=NullType, T2=NullType)(Type t1, Type t2, ubyte* r1, ubyte* r2)
+    private void binaryDispatcher2(string fun, T1 = NullType, T2 = NullType)(Type t1, Type t2, ubyte* r1, ubyte* r2)
     {
-        static if(is(T1 == NullType))
+        static if (is(T1 == NullType))
         {
             match(t1,
                   (Int8Type t) => binaryDispatcher2!(fun, T2, byte)(t2, null, r1, r2),
@@ -433,7 +433,7 @@ private final class InterpreterContext
         {
             mixin(code0);
             return;
-        } 
+        }
         else static if (__traits(compiles, { mixin(code1); }))
         {
             mixin(code1);
@@ -449,7 +449,7 @@ private final class InterpreterContext
         }
     }
 
-    private void emulateALU2(string op, bool binary, string resultType="T", string rhsType="T")(Type lhsType, ubyte* dstMem, ubyte* lhsMem, ubyte* rhsMem)
+    private void emulateALU2(string op, bool binary, string resultType = "T", string rhsType = "T")(Type lhsType, ubyte* dstMem, ubyte* lhsMem, ubyte* rhsMem)
     {
         match(lhsType,
               (Int8Type t) => emulateALUForType!(byte, op, binary, resultType, rhsType)(dstMem, lhsMem, rhsMem),
@@ -470,7 +470,7 @@ private final class InterpreterContext
               });
     }
 
-    private void emulateALU(string op, bool binary, string resultType="T", string rhsType="T")(Instruction inst)
+    private void emulateALU(string op, bool binary, string resultType = "T", string rhsType = "T")(Instruction inst)
     {
         auto lhsType = inst.sourceRegister1.type;
         auto lhsMem = getValue(inst.sourceRegister1);
@@ -492,7 +492,7 @@ private final class InterpreterContext
         return false;
     }
 
-    private void emulateArrayALU(string op, bool binary, string resultType="T", string rhsType="T")(Instruction inst)
+    private void emulateArrayALU(string op, bool binary, string resultType = "T", string rhsType = "T")(Instruction inst)
     {
         size_t dstSize;
         size_t lhsSize;
@@ -554,7 +554,7 @@ private final class InterpreterContext
 
         auto fptr = intrinsicFunctions[intrinsic];
 
-        dispatchFFI!true(intrinsic.parameters, intrinsic.returnType, CallingConvention.cdecl, fptr, dst, args); 
+        dispatchFFI!true(intrinsic.parameters, intrinsic.returnType, CallingConvention.cdecl, fptr, dst, args);
 
         releaseLocals();
         switchToContext(callCtx);
@@ -573,13 +573,13 @@ private final class InterpreterContext
         dispatchFFI!true(ffiSig.parameterTypes, ffiSig.returnType, ffiSig.callingConvention, fptr, dst, args);
     }
 
-    private void dispatchFFI(bool isIntrinsic, T)(ReadOnlyIndexable!T paramTypes, Type _returnType, CallingConvention convention, 
+    private void dispatchFFI(bool isIntrinsic, T)(ReadOnlyIndexable!T paramTypes, Type _returnType, CallingConvention convention,
                              FFIFunction entry, ubyte* returnMem, ubyte*[] args)
     {
         try
         {
             _interpreter.dispatchFFI!isIntrinsic(paramTypes, _returnType, convention, entry, returnMem, args);
-        } 
+        }
         catch (UnwindException)
         {
             // link the FFIs context.
@@ -998,7 +998,7 @@ private final class InterpreterContext
                 auto field = *inst.operand.peek!Field();
                 auto dest = getValue(inst.targetRegister);
                 auto source = _interpreter.getGlobal(field);
-                auto size = computeSize(field.type, is32Bit); 
+                auto size = computeSize(field.type, is32Bit);
                 memcpy(dest, source, size);
                 break;
 
@@ -1006,7 +1006,7 @@ private final class InterpreterContext
                 auto field = *inst.operand.peek!Field();
                 auto source = getValue(inst.sourceRegister1);
                 auto dest = _interpreter.getGlobal(field);
-                auto size = computeSize(field.type, is32Bit); 
+                auto size = computeSize(field.type, is32Bit);
                 memcpy(dest, source, size);
                 break;
 
@@ -1014,7 +1014,7 @@ private final class InterpreterContext
                 auto field = *inst.operand.peek!Field();
                 auto dest = getValue(inst.targetRegister);
                 auto source = _interpreter.getGlobal(field);
-                auto size = computeSize(field.type, is32Bit); 
+                auto size = computeSize(field.type, is32Bit);
                 *cast(ubyte**)dest = source;
                 break;
 
@@ -1078,7 +1078,7 @@ private final class InterpreterContext
 
                 if (target.attributes == FunctionAttributes.intrinsic)
                     subContext.doIntrinsic(inst);
-                else 
+                else
                 {
                     subContext.gotoEntry();
                     switchToContext(subContext);
@@ -1098,7 +1098,7 @@ private final class InterpreterContext
                     subContext.returnContext = this;
                     subContext.args = collectArgs();
                     switchToContext(subContext);
-                } 
+                }
                 else if (auto target = toFunction(funPtr))
                     doIndirectIntrinsic(inst);
                 else
@@ -1110,7 +1110,7 @@ private final class InterpreterContext
                 args = collectArgs();
                 shadowLocals();
                 gotoEntry();
-                break;           
+                break;
 
             case OperationCode.ariAdd:
                 emulateALU!("+", true)(inst);
@@ -1142,7 +1142,7 @@ private final class InterpreterContext
 
             case OperationCode.bitOr:
                 emulateALU!("|", true)(inst);
-                break;   
+                break;
 
             case OperationCode.bitXOr:
                 emulateALU!("^", true)(inst);
@@ -1233,7 +1233,7 @@ private final class InterpreterContext
                 break;
 
             case OperationCode.return_:
-                auto src = getValue(inst.sourceRegister1);                
+                auto src = getValue(inst.sourceRegister1);
                 auto size = computeSize(inst.sourceRegister1.type, is32Bit);
                 memcpy(returnMem, src, size);
 
@@ -1252,7 +1252,7 @@ private final class InterpreterContext
                     // debug instruction
                     auto arg = inst.sourceRegister1;
                     writeln( prettyPrint(arg.type, is32Bit, getValue(arg), arg.name ) );
-                } 
+                }
                 else
                 {
                     auto srcMem = getValue(inst.sourceRegister1);
@@ -1341,7 +1341,7 @@ private final class InterpreterContext
                 auto goals = *inst.operand.peek!(Tuple!(BasicBlock, BasicBlock))();
                 if (value != 0)
                     gotoBlock(goals.x);
-                else 
+                else
                     gotoBlock(goals.y);
                 break;
 
@@ -1510,9 +1510,9 @@ private class UnwindException : Exception
     }
 }
 
-shared static this() 
+shared static this()
 {
-    ffiStructTypeCache = new Dictionary!(Type, FFIType*, false);
+    ffiStructTypeCache = new typeof(ffiStructTypeCache)();
     ffiStructTypeCacheMutex = new Mutex();
     nativeIntSize = computeSize(NativeUIntType.instance, is32Bit);
     unwindException = new UnwindException();
@@ -1607,7 +1607,7 @@ private FFIInterface toFFIConvention(CallingConvention cc)
 private Function toFunction(ubyte* mem)
 {
     // auto fun = cast(Function)(*cast(ubyte**)mem);
-    // Unfortunatley D wont validate the above cast. 
+    // Unfortunatley D wont validate the above cast.
     // We have to do this by ourself here by walking over all currently loaded functions.
     // At the moment we just assume it always is a Function.
     // This wont allow code passing native funcpointers around for the moment.
@@ -1634,7 +1634,7 @@ private size_t localTLSColor;
 private __gshared size_t globalTLSColor;
 
 static this()
-{    
+{
     tlsGlobals = new typeof(tlsGlobals)();
 }
 
@@ -1715,16 +1715,16 @@ public final class Interpreter : ExecutionEngine
         super(gc);
         _weakThis = new Weak!Interpreter(this);
         _gc = gc;
-        _closureCache = new Dictionary!(Function, FFIClosure, false);
-        _globals = new Dictionary!(Field, ubyte*, false);
+        _closureCache = new typeof(_closureCache)();
+        _globals = new typeof(_globals)();
         _globalsMutex = new Mutex();
         _stackAlloc = new StackAllocator(_gc);
         //_debugger = new InterpreterDebuggerServer(this);
         _vmContext = context;
-        _ffiLibraries = new Dictionary!(string, void*)();
-        _ffiEntrypoints = new Dictionary!(Tuple!(string, string), EntryPoint)();
-        _loadedModules = new HashSet!Module();
-        _attachedThreads = new HashSet!Thread();
+        _ffiLibraries = new typeof(_ffiLibraries)();
+        _ffiEntrypoints = new typeof(_ffiEntrypoints)();
+        _loadedModules = new typeof(_loadedModules)();
+        _attachedThreads = new typeof(_attachedThreads)();
         _loadedModulesMutex = new Mutex();
         _attachedThreadsMutex = new Mutex();
     }
@@ -1746,7 +1746,7 @@ public final class Interpreter : ExecutionEngine
         }
 
 
-        // Notice other threads that an Interpreter died. During their next TLS access 
+        // Notice other threads that an Interpreter died. During their next TLS access
         // they will sync their thread local tlsGlobals using compactTLSGlobals()
         atomicOp!"+="(*cast(shared)&globalTLSColor, 1);
 
@@ -1838,7 +1838,7 @@ public final class Interpreter : ExecutionEngine
 
         attachToRuntime();
         dispatchFFI!false(arguments, returnType, callingConvention, function_, returnMem, arguments);
-        return result; 
+        return result;
     }
 
     private ubyte* getGlobal(Field f)
@@ -1851,7 +1851,7 @@ public final class Interpreter : ExecutionEngine
                 return *cache;
 
             return tlsGlobals[key] = cast(ubyte*)_calloc(1, computeSize(f.type, is32Bit));
-        } 
+        }
         else
         {
             _globalsMutex.lock();
@@ -1895,7 +1895,7 @@ public final class Interpreter : ExecutionEngine
         if (function_.attributes & FunctionAttributes.intrinsic)
         {
             auto fptr = intrinsicFunctions[function_];
-            dispatchFFI!true(function_.parameters, function_.returnType, CallingConvention.cdecl, fptr, returnMem, argMem); 
+            dispatchFFI!true(function_.parameters, function_.returnType, CallingConvention.cdecl, fptr, returnMem, argMem);
             return;
         }
 
@@ -2048,8 +2048,8 @@ public final class Interpreter : ExecutionEngine
         // (semantically a jump instruction within the native code) to another trampoline we will
         // leak this D stackframe.
         // But there is not much we can do about this for the moment.
-        auto trampoline = delegate void(void* ret, void** args) 
-        { 
+        auto trampoline = delegate void(void* ret, void** args)
+        {
             static if (attach)
                 attachToRuntime();
 
@@ -2071,7 +2071,7 @@ public final class Interpreter : ExecutionEngine
                 auto argsA = new void*[params];
                 for (auto i = 0; i < params; i++)
                     argsA[i] = args[i];
-                ffiCall(f, returnType, argTypes, ret, argsA, sourceconv); 
+                ffiCall(f, returnType, argTypes, ret, argsA, sourceconv);
             }
         };
 
@@ -2095,7 +2095,7 @@ public final class Interpreter : ExecutionEngine
         _gc.free(r);
     }
 
-    private void dispatchFFI(bool isIntrinsic, T, U)(ReadOnlyIndexable!T paramTypes, Type _returnType, CallingConvention convention, 
+    private void dispatchFFI(bool isIntrinsic, T, U)(ReadOnlyIndexable!T paramTypes, Type _returnType, CallingConvention convention,
                             FFIFunction entry, ubyte* returnMem, U args)
     {
         auto argCount = paramTypes.count;
@@ -2109,7 +2109,7 @@ public final class Interpreter : ExecutionEngine
 
         foreach (idx, p; paramTypes)
         {
-            static if (is(T == Parameter) || is(T == RuntimeValue)) 
+            static if (is(T == Parameter) || is(T == RuntimeValue))
                 auto t = p.type;
             else
                 auto t = p;
@@ -2131,7 +2131,7 @@ public final class Interpreter : ExecutionEngine
             argMem[0] = cast(ubyte*)&_vmContext;
         }
 
-        ffiCall(entry, returnType, argTypes, returnMem, argMem, cconv); 
+        ffiCall(entry, returnType, argTypes, returnMem, argMem, cconv);
     }
 
     private EntryPoint resolveEntryPoint(FFISignature sig)
