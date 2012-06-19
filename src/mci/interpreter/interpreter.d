@@ -1650,7 +1650,7 @@ private void compactTLSGlobals()
         auto compactedGlobals = new Dictionary!(Tuple!(Weak!Interpreter, Field), ubyte*, false);
         foreach (kv; tlsGlobals)
         {
-            if (kv.x.x.object)
+            if (kv.x.x.getObject())
                 compactedGlobals.add(kv.x, kv.y);
         }
         tlsGlobals = compactedGlobals;
