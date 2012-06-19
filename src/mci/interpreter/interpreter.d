@@ -1731,7 +1731,20 @@ public final class Interpreter : ExecutionEngine
 
     public override void terminate()
     {
-        super.terminate();
+        super.terminate(); // do this after thread exits?
+
+        detachFromRuntime();
+
+        {
+            _attachedThreadsMutex.lock();
+
+            scope (exit)
+                _attachedThreadsMutex.unlock();
+
+            foreach (thread; _attachedThreads)
+                writefln("Warning: Thread %s did not detach from runtime, it wont invoke any thread exit point anymore!", cast(void*)thread);
+        }
+
 
         // Notice other threads that an Interpreter died. During their next TLS access 
         // they will sync their thread local tlsGlobals using compactTLSGlobals()
@@ -1907,19 +1920,16 @@ public final class Interpreter : ExecutionEngine
     private void detachFromRuntime()
     {
         bool detach;
+        auto thisThread = Thread.getThis();
 
         {
-            auto thisThread = Thread.getThis();
             _attachedThreadsMutex.lock();
 
             scope (exit)
                 _attachedThreadsMutex.unlock();
 
             if (thisThread in _attachedThreads)
-            {
-                _attachedThreads.remove(thisThread);
                 detach = true;
-            }
         }
 
         if (detach)
@@ -1927,6 +1937,14 @@ public final class Interpreter : ExecutionEngine
             foreach (mod; _loadedModules)
                 if (mod.threadExitPoint)
                     execute(mod.threadExitPoint, new NoNullList!RuntimeValue());
+
+            // we need to wait with removing up to this point, otherwise executingthe thredExitPoint will reattach
+            _attachedThreadsMutex.lock();
+
+            scope (exit)
+                _attachedThreadsMutex.unlock();
+            _attachedThreads.remove(thisThread);
+
             _gc.detach();
         }
 
@@ -1941,9 +1959,12 @@ public final class Interpreter : ExecutionEngine
         auto thisThread = Thread.getThis();
         if (!thisThread)
         {
+            GC.disable();
             thisThread = thread_attachThis();
             rt_moduleTlsCtor();
+            GC.enable();
             registerThreadCleanup(&detachFromRuntime);
+            assert(thread_needLock());
         }
 
         bool attach;
@@ -1955,7 +1976,10 @@ public final class Interpreter : ExecutionEngine
                 _attachedThreadsMutex.unlock();
 
             if (_attachedThreads.add(thisThread))
+            {
+                writefln("Attached %s", cast(void*)thisThread);
                 attach = true;
+            }
         }
 
         if (attach)
