@@ -11,6 +11,8 @@ import core.atomic,
        mci.core.config,
        mci.core.container,
        mci.core.code.functions,
+       mci.core.math,
+       mci.core.memory,
        mci.core.sync,
        mci.core.tuple,
        mci.core.typing.core,
@@ -1500,7 +1502,6 @@ private __gshared size_t nativeIntSize;
 private __gshared UnwindException unwindException;
 private __gshared size_t maxPadding;
 private __gshared size_t sseAlignment;
-private __gshared size_t sseAlignmentMask;
 
 private class UnwindException : Exception
 {
@@ -1519,27 +1520,23 @@ shared static this()
 
     static if (architecture == Architecture.x86)
     {
-        sseAlignment = is32Bit ? 32 : 64;
-        if (mmx)
-            sseAlignment = 64;
+        sseAlignment = size_t.sizeof;
         if (sse)
-            sseAlignment = 128;
-        //if (avx) -- not supported by cpuid.d, yet
-        //    sseAlignment = 256;
+            sseAlignment = 16;
+        if (avx)
+            sseAlignment = 32;
     }
     else
-        sseAlignment = 256;
+        sseAlignment = 32;
 
-    sseAlignment /= 8;
-    sseAlignmentMask = sseAlignment - 1;
-    maxPadding = sseAlignment - is32Bit ? 4 : 8;
+    maxPadding = sseAlignment - size_t.sizeof;
 }
 
 ubyte* alignArray(ubyte* mem)
 {
-    size_t i = cast(size_t)mem;
-    i = (i + sseAlignmentMask) & ~sseAlignmentMask;
-    return cast(ubyte*)i;
+    auto al = alignTo(cast(size_t)mem, sseAlignment);
+    assert((al % sseAlignment) == 0);
+    return cast(ubyte*)al;
 }
 
 private FFIType* toFFIType(Type type)
@@ -1553,8 +1550,6 @@ private FFIType* toFFIType(Type type)
                  (Int32Type t) => FFIType.ffiInt,
                  (UInt64Type t) => FFIType.ffiULong,
                  (Int64Type t) => FFIType.ffiLong,
-                 // replace with FFI native types rather than is32Bit switch here
-                 // as soon they are available
                  (NativeIntType t) => is32Bit ? FFIType.ffiInt : FFIType.ffiLong,
                  (NativeUIntType t) => is32Bit ? FFIType.ffiUInt : FFIType.ffiULong,
                  (Float32Type t) => FFIType.ffiFloat,
