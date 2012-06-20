@@ -1733,7 +1733,7 @@ public final class Interpreter : ExecutionEngine
     {
         super.terminate(); // do this after thread exits?
 
-        detachFromRuntime();
+        detachFromMCIRuntime();
 
         {
             _attachedThreadsMutex.lock();
@@ -1917,7 +1917,7 @@ public final class Interpreter : ExecutionEngine
             _stackAlloc.free(param.type);
     }
 
-    private void detachFromRuntime()
+    private void detachFromMCIRuntime()
     {
         bool detach;
         auto thisThread = Thread.getThis();
@@ -1947,11 +1947,20 @@ public final class Interpreter : ExecutionEngine
 
             _gc.detach();
         }
+    }
 
+    private void detachFromDRuntime()
+    {
         GC.disable();
         thread_detachThis();
         rt_moduleTlsDtor();
         GC.enable();
+    }
+
+    private void detachFromAllRuntimes()
+    {
+        detachFromMCIRuntime();
+        detachFromDRuntime();
     }
 
     private void attachToRuntime()
@@ -1963,7 +1972,7 @@ public final class Interpreter : ExecutionEngine
             thisThread = thread_attachThis();
             rt_moduleTlsCtor();
             GC.enable();
-            registerThreadCleanup(&detachFromRuntime);
+            registerThreadCleanup(&detachFromAllRuntimes);
             assert(thread_needLock());
         }
 
