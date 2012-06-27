@@ -1378,7 +1378,7 @@ public final class Interpreter
     }
 
 
-    public RuntimeObject gcallocate(Type t, uint size)
+    public RuntimeObject gcallocate(Type t, size_t size)
     {
         return _gc.allocate(t, size);
     }
