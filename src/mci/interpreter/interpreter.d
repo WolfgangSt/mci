@@ -24,12 +24,13 @@ import core.atomic,
        mci.interpreter.debuggee,
        mci.interpreter.exception,
        mci.core.code.instructions,
+       mci.vm.code,
        mci.vm.exception,
        mci.vm.execution,
+       mci.vm.ffi,
        mci.vm.intrinsics.context,
        mci.vm.intrinsics.declarations,
        mci.vm.memory.base,
-       mci.vm.ffi,
        mci.vm.memory.info,
        mci.vm.memory.layout,
        mci.vm.memory.prettyprint,
@@ -596,11 +597,17 @@ private final class InterpreterContext
 
     private void doFFI(Instruction inst)
     {
-        auto ffisig = *inst.operand.peek!FFISignature();
-        auto fptr = cast(FFIFunction)_interpreter.resolveEntryPoint(ffisig);
+        FFIFunction fptr;
 
-        if (fptr is null)
-            throw new InterpreterException("Cannot resolve export " ~ ffisig.entryPoint ~ " in " ~ ffisig.library);
+        if (inst.opCode.code == OperationCode.ffi)
+        {
+            auto ffisig = *inst.operand.peek!FFISignature();
+            fptr = cast(FFIFunction)_interpreter.resolveEntryPoint(ffisig);
+
+            if (fptr is null)
+                throw new InterpreterException("Cannot resolve export " ~ ffisig.entryPoint ~ " in " ~ ffisig.library);
+        } else // opraw
+           fptr = _interpreter.getCodeRegion(inst);
 
         // by specification ffi is the only instruction in the block and
         // the FFI signature corresponds to the current methods signature.
@@ -797,7 +804,7 @@ private final class InterpreterContext
                 break;
 
             case OperationCode.raw:
-                writeln("Interpreter cannot execute raw code");
+                doFFI(inst);
                 break;
 
             case OperationCode.loadI8:
@@ -1699,6 +1706,8 @@ public final class Interpreter : ExecutionEngine
     private HashSet!Thread _attachedThreads;
     private Mutex _loadedModulesMutex;
     private Mutex _attachedThreadsMutex;
+    private CodeMemoryAllocator _codeAllocator;
+    private Dictionary!(Instruction, ubyte*) _codeRegions;
 
     public this(GarbageCollector gc)
     in
@@ -1722,6 +1731,8 @@ public final class Interpreter : ExecutionEngine
         _attachedThreads = new typeof(_attachedThreads)();
         _loadedModulesMutex = new Mutex();
         _attachedThreadsMutex = new Mutex();
+        _codeAllocator = new CodeMemoryAllocator();
+        _codeRegions = new typeof(_codeRegions)();
     }
 
     public override void terminate()
@@ -1859,6 +1870,25 @@ public final class Interpreter : ExecutionEngine
 
             return _globals[f] = cast(ubyte*)_calloc(1, computeSize(f.type, is32Bit));
         }
+    }
+
+    private FFIFunction getCodeRegion(Instruction inst)
+    {
+        if (auto region = _codeRegions.get(inst))
+            return cast(FFIFunction)*region;
+
+        auto data = *inst.operand.peek!(ReadOnlyIndexable!ubyte)();
+        auto region = _codeAllocator.allocate(data.count);
+
+        if (!region)
+            throw new InterpreterException("getCodeRegion failed");
+
+        _codeRegions.add(inst, region);
+
+        foreach (i, b; data)
+            region[i] = b;
+
+        return cast(FFIFunction)region;
     }
 
     private void defaultExceptionHandler()
