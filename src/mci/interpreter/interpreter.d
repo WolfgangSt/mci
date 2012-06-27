@@ -1,11 +1,11 @@
 module mci.interpreter.interpreter;
 
-import core.atomic,
-       core.stdc.string,
+import core.stdc.string,
        core.memory,
        core.thread,
        ffi,
        mci.core.analysis.utilities,
+       mci.core.atomic,
        mci.core.code.modules,
        mci.core.common,
        mci.core.config,
@@ -51,7 +51,6 @@ alias calloc _calloc;
 alias free _free;
 alias void delegate() ExceptionHandler;
 alias mci.core.config.is32Bit is32Bit;
-alias core.atomic.atomicLoad atomicLoad;
 
 enum bool longjmpUnwind = true;
 
@@ -1497,6 +1496,7 @@ private final class InterpreterContext
             //    throw new InterpreterException("Unsupported opcode: " ~ inst.opCode.name);
         }
         //GC.collect();
+        synchronizeManaged();
     }
 }
 
@@ -1509,6 +1509,10 @@ private __gshared size_t nativeIntSize;
 private __gshared UnwindException unwindException;
 private __gshared size_t maxPadding;
 private __gshared size_t sseAlignment;
+private __gshared Atomic!size_t managedThreads;
+private __gshared Atomic!bool synchronizing;
+private __gshared Condition syncCondition;
+private __gshared Mutex syncMutex;
 
 private class UnwindException : Exception
 {
@@ -1524,6 +1528,8 @@ shared static this()
     ffiStructTypeCacheMutex = new Mutex();
     nativeIntSize = computeSize(NativeUIntType.instance, is32Bit);
     unwindException = new UnwindException();
+    syncMutex = new Mutex();
+    syncCondition = new Condition(syncMutex);
 
     static if (architecture == Architecture.x86)
     {
@@ -1537,6 +1543,67 @@ shared static this()
         sseAlignment = 32;
 
     maxPadding = sseAlignment - size_t.sizeof;
+}
+
+private void enterManaged()
+{
+    synchronizeManaged();
+    managedThreads += 1;
+}
+
+private void exitManaged()
+{
+    managedThreads -= 1;
+}
+
+private void synchronizeManaged()
+{
+    if (synchronizing.value)
+    {
+        syncMutex.lock();
+
+        scope (exit)
+            syncMutex.unlock();
+
+        syncCondition.wait();
+    }
+}
+
+public void stopWorld()
+{
+    synchronizing.value = true;
+    while (true)
+    {
+        Thread.yield(); // give other threads some time to synchronize
+        if (managedThreads.value == 0)
+            break;
+    }
+
+    // now we reached a point where all managed threads are synchronized.
+    // stop the rest of the known world and execute the protecetd region
+    //thread_suspendAll();
+}
+
+public void resumeWorld()
+{
+    //thread_resumeAll();
+
+    // resume the managed world
+    synchronizing.value = false;
+
+    syncMutex.lock();
+
+    scope (exit)
+            syncMutex.unlock();
+
+    syncCondition.notifyAll();
+}
+
+public void syncWorld(void delegate() protectedRegion)
+{
+    stopWorld();
+    protectedRegion();
+    resumeWorld();
 }
 
 ubyte* alignArray(ubyte* mem)
@@ -1633,7 +1700,7 @@ private InterpreterContext currentContext;
 private ExceptionRecord currentException;
 private Dictionary!(Tuple!(Weak!Interpreter, Field), ubyte*, false) tlsGlobals;
 private size_t localTLSColor;
-private __gshared size_t globalTLSColor;
+private __gshared Atomic!size_t globalTLSColor;
 
 static this()
 {
@@ -1644,7 +1711,7 @@ private void compactTLSGlobals()
 {
     while (true)
     {
-        auto globalColor = atomicLoad(*cast(shared)&globalTLSColor);
+        auto globalColor = globalTLSColor.value;
         if (localTLSColor == globalColor)
             break;
 
@@ -1666,6 +1733,7 @@ private void step()
 
 private void run()
 {
+    enterManaged();
     while (currentContext)
     {
         if (currentContext.nativeTransition)
@@ -1675,6 +1743,7 @@ private void run()
         }
         currentContext.step();
     }
+    exitManaged();
 }
 
 private void setException(ExceptionRecord exception)
@@ -1754,7 +1823,7 @@ public final class Interpreter : ExecutionEngine
 
         // Notice other threads that an Interpreter died. During their next TLS access
         // they will sync their thread local tlsGlobals using compactTLSGlobals()
-        atomicOp!"+="(*cast(shared)&globalTLSColor, 1);
+        globalTLSColor += 1;
 
         // unload all ffi librarys
         foreach (void* lib; _ffiLibraries.values)
@@ -2165,7 +2234,9 @@ public final class Interpreter : ExecutionEngine
             argMem[0] = cast(ubyte*)&_vmContext;
         }
 
+        exitManaged();
         ffiCall(entry, returnType, argTypes, returnMem, argMem, cconv);
+        enterManaged();
     }
 
     private EntryPoint resolveEntryPoint(FFISignature sig)
