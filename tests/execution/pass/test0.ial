@@ -1,0 +1,12 @@
+function int32 main()
+{
+    register int32 result;
+
+    block entry
+    {
+        result = load.i32 (0);
+        return result;
+    }
+}
+
+entry main;

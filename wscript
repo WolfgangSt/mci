@@ -232,6 +232,8 @@ def test(ctx):
     run_test('disassembler', 'pass')
     run_test('verifier', 'pass')
     run_test('verifier', 'fail')
+    run_test('execution', 'pass')
+    run_test('execution', 'fail')
 
 class TestContext(Build.BuildContext):
     cmd = 'test'

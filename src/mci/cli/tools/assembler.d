@@ -20,6 +20,7 @@ import core.memory,
        mci.core.io,
        mci.core.code.functions,
        mci.core.code.modules,
+       mci.core.typing.core,
        mci.vm.exception,
        mci.vm.execution,
        mci.vm.intrinsics.declarations,
@@ -204,6 +205,7 @@ public final class AssemblerTool : Tool
 
         try
         {
+            int exitCode = 1;
             auto manager = new ModuleManager();
             manager.attach(intrinsicModule);
 
@@ -247,6 +249,8 @@ public final class AssemblerTool : Tool
                     {
                         logf("The program quitted with:");
                         logf( prettyPrint( result.type, mci.core.config.is32Bit, result.data, "(return value)" ) );
+                        if (cast(Int32Type)result.type)
+                            exitCode = *cast(int*)result.data;
                     }
                     else
                         logf("The program quitted without return value.");
@@ -281,7 +285,7 @@ public final class AssemblerTool : Tool
                 interpreter.terminate();
                 gc.terminate();
 
-                return 0;
+                return exitCode;
             }
             (new ModuleWriter()).save(mod, output);
         }

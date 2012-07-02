@@ -1,0 +1,3 @@
+C: asm <file> -i
+R: 0
+E: true
