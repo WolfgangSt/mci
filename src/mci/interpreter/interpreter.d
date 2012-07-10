@@ -340,7 +340,6 @@ private final class InterpreterContext
 
     private void doConv(T1, T2)(T1* t1, T2* t2)
     {
-        //writefln("conv " ~ T2.stringof ~ " [%s] -> " ~ T1.stringof, *t2);
         *t1 = cast(T1)*t2;
     }
 
@@ -443,10 +442,6 @@ private final class InterpreterContext
         }
         else
         {
-            writeln("Neither of");
-            writeln(code0);
-            writeln(code1);
-            writeln("Is known..");
             throw new InterpreterException("Invalid operation: " ~ op ~ " for " ~ T.stringof);
         }
     }
@@ -789,8 +784,6 @@ private final class InterpreterContext
         // check for debugging
         //if (_interpreter.)
 
-        //writefln("%s.%s.%s: %s", ip.block.function_.name, ip.block.name, ip.instructionIndex - 1, inst.toString());
-
         // unroll this using metacode if possible for readability
         final switch (inst.opCode.code)
         {
@@ -799,7 +792,6 @@ private final class InterpreterContext
                 break;
 
             case OperationCode.dead:
-                writeln("Warning dead code reached");
                 break;
 
             case OperationCode.raw:
@@ -1810,17 +1802,6 @@ public final class Interpreter : ExecutionEngine
 
         detachFromMCIRuntime();
 
-        {
-            _attachedThreadsMutex.lock();
-
-            scope (exit)
-                _attachedThreadsMutex.unlock();
-
-            foreach (thread; _attachedThreads)
-                writefln("Warning: Thread %s did not detach from runtime, it wont invoke any thread exit point anymore!", cast(void*)thread);
-        }
-
-
         // Notice other threads that an Interpreter died. During their next TLS access
         // they will sync their thread local tlsGlobals using compactTLSGlobals()
         globalTLSColor += 1;
@@ -2079,10 +2060,7 @@ public final class Interpreter : ExecutionEngine
                 _attachedThreadsMutex.unlock();
 
             if (_attachedThreads.add(thisThread))
-            {
-                writefln("Attached %s", cast(void*)thisThread);
                 attach = true;
-            }
         }
 
         if (attach)
